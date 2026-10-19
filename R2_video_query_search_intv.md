@@ -72,6 +72,7 @@
 | Freshness | New uploads searchable within ~24 h |
 | Scale | ~10⁹ indexable videos, ~500 hours uploaded per minute; feature traffic ~10⁶–10⁷ queries/day |
 | Query clip | Processed **ephemerally**: not stored or trained on without consent |
+| **Labels** | No gold set exists today; there's a **budget for expert labelling** (dancers, coaches) of ~10–20k query-moment pairs per vertical, graded same move / move family / style / unrelated, with start and end timestamps. They are the **offline eval set** (recall@100, NDCG@10, temporal IoU) and **train the reranker**. The retrieval encoder trains on **weak and free labels** instead: titles, chapters, timestamped comments, and multi-camera footage of the same moment (§5) |
 
 **FR:** upload and trim a clip · moment-level semantic retrieval · temporal localisation in results · context diversity · near-duplicate removal · policy and availability filtering · explanation of each match · feedback ("not this move") · a text fallback when confidence is low.
 
@@ -148,6 +149,29 @@ TIERED (order-of-magnitude):
            ≈ 3–6×10⁹ moments × 64 B (product-quantised)  ≈ 200–400 GB
            → sharded by vertical, replicated; fits a few dozen index servers
 
+PARTITION · SHARD · REPLICA, from one vertical's point of view (illustrative)
+  PARTITION = WHICH INDEX: one per vertical (its own encoder adapter, so its
+    own embedding space); a query only ever searches ITS vertical
+      dance  ≈ 1.5×10⁹ moments × ~72 B (64 B code + ID) ≈ 110 GB
+      skate  ≈ 3×10⁸ moments                            ≈  22 GB
+  SHARD = A PIECE OF ONE PARTITION, sized to fit one machine (~30 GB here)
+      dance → 4 shards: moment goes to shard  hash(moment_id) mod 4
+      skate → 1 shard
+      HASHING spreads moments evenly, so no shard holds a hot cluster; the
+      catch is that a query's neighbours could be on ANY shard
+  REPLICA = A COPY OF A SHARD, for query volume and failover
+      dance peak ~200 QPS, ~70 QPS per replica → 3 replicas per shard
+      → dance = 4 shards × 3 replicas = 12 machines · skate = 1 × 2 = 2
+
+  A DANCE QUERY: route to the dance partition → send to ALL 4 shards in
+    parallel (one replica each, picked by the load balancer) → each returns
+    its local top-1,000 → merge → global top-1,000 → reranker
+  A NEW DANCE MOMENT: hash(moment_id) mod 4 → shard 2 → written to all of
+    shard 2's replicas
+  → partitioning cuts what a query searches · sharding makes it fit and
+    balances data · replication absorbs peak load
+  (full explainer with diagrams: NOTES_ann_index_partitioning_sharding_replication.md)
+
 INDEXING NEW UPLOADS
   500 h/min ≈ 720k hours/day → ~100k hours/day of human-activity video
   cheap motion features find proposals first; the EXPENSIVE encoder runs
@@ -200,6 +224,15 @@ UPLOAD: trim + downscale ON THE PHONE to 224p / 8 fps → ~300 KB for 10 s
        ▼
 ┌─ 2. MOMENT PROPOSALS ──────────────────────────────────────────
 │ shot boundaries + motion-energy peaks + "people moving" detector
+│   SHOT BOUNDARIES: colour-histogram jumps between frames (or a small
+│     shot-detection net): near-free, no GPU
+│   MOTION ENERGY: frame differencing / optical-flow magnitude: no model
+│   PEOPLE MOVING: a SMALL person detector (YOLO-nano class) on frames
+│     sampled at ~2 fps; keep windows with a person AND high motion
+│   WHY SMALL: ~75 h/min of indexed video ≈ 4,500 video-s/s → ~9k frames/s
+│     at 2 fps · YOLO-nano ≈ 1k frames/s per GPU → ~10 GPUs · Mask R-CNN
+│     (Detectron2) ≈ 15 frames/s per GPU → ~600 GPUs. Proposals only need
+│     recall; the pose model (step 3) runs only on the windows they keep
 │ OUTPUT: ~30 candidate moments per video, each 2–6 s, with times
 └──────┬─────────────────────────────────────────────────────────
        ▼
@@ -243,6 +276,18 @@ UPLOAD: trim + downscale ON THE PHONE to 224p / 8 fps → ~300 KB for 10 s
 │ dynamic time warping, or a small cross-attention model.
 │ Checks the SAME SEQUENCE OF MOVES, at any speed, not just a
 │ similar average (G1's geometric verification, in time)
+│   INPUT: per-frame POSE vectors over time, not one pooled embedding
+│     query: 90 frames × pose · candidate: 120 frames × pose
+│   DTW (cheap baseline, no training): find the best frame-to-frame
+│     alignment, letting either clip run faster or slower; the
+│     alignment's total distance is the score; the aligned span
+│     gives start/end
+│   CROSS-ATTENTION (learned): query frames attend to candidate
+│     frames → a match score + a start/end head; trained on expert
+│     pairs (pairwise loss), so it learns which body parts matter
+│   ⚠ APPEARANCE is NOT a relevance input here: a similar venue or
+│     outfit must never raise a score. Appearance embeddings are
+│     used only by box E, to spread the results out (MMR)
 │ OUTPUT: calibrated match score + refined start/end per candidate
 └──────┬─────────────────────────────────────────────────────────
        ▼
@@ -338,6 +383,49 @@ L = InfoNCE / supervised contrastive, with in-batch negatives:
 
 **The reranker:** a small cross-attention model over the query and candidate pose/frame sequences (or dynamic time warping on pose for a cheaper baseline), trained with a **pairwise ranking loss** on expert-labelled pairs and click data. A second head predicts the **start/end** of the move in the candidate (for the deep link).
 
+```
+INPUT (one query-candidate pair at a time; ~200 pairs per query)
+  QUERY      the trimmed clip as a POSE SEQUENCE: e.g. 90 frames ×
+             (17 body keypoints × x, y, confidence = 51 numbers per frame)
+  CANDIDATE  the proposed moment ± 2 s of context: e.g. 150 frames × 51
+  + per frame: a time position and a "query or candidate" tag
+  + optionally a per-frame MOTION feature (optical-flow summary)
+  ✗ NO appearance (colours, background, faces): a similar venue or outfit
+    must never raise the score
+
+MODEL: a CROSS-ENCODER transformer whose input is TWO SEQUENCES OF
+  DIFFERENT LENGTHS, joined into one:
+    [CLS] q₁ q₂ … q_Tq [SEP] c₁ c₂ … c_Tc
+    each qᵢ, cⱼ = one frame's pose, projected to a 128-d vector, plus its
+    time position and a "query / candidate" segment tag
+  LENGTH CAPS: query ≤ 150 frames, candidate ≤ 300 (≈ 5 s and 10 s at 30 fps)
+    · longer → sample fewer frames per second, or crop around the proposal
+    · shorter → pad, with an ATTENTION MASK so padding is ignored
+    · so every pair is a fixed-shape tensor, and ~200 pairs batch on one GPU
+  ATTENTION: every frame attends to every frame of BOTH clips in every
+    layer, so query frames look at candidate frames and back. That's what
+    lets it line up "kick-up → spin → freeze" in the query with the same
+    three phases in the candidate, even when one is slower or filmed from
+    another angle. (A two-tower model can't: its clips never see each other)
+  The [CLS] position feeds the score head; the candidate positions feed the
+  span head
+
+OUTPUT (two heads)
+  1. MATCH SCORE   one logit → P(same move)              → ranks the 200
+  2. SPAN          per candidate frame: P(move starts here), P(move ends here)
+                   → the timestamp the deep link jumps to
+
+TRAINING
+  score head: PAIRWISE, for the same query a better candidate outranks a worse one
+      L = −log σ(s_better − s_worse)
+      graded expert labels give the pairs: same move > move family > style > unrelated
+      ⭐ hard negative: the SAME performer doing a DIFFERENT move (kills the
+         "match the dancer" shortcut)
+      clicks: weak extra pairs, IPW-weighted for position (R1 §5.2)
+  span head: cross-entropy on the expert-marked start and end frames
+  then: calibrate the score (isotonic) so the confidence gate can use it
+```
+
 ### 5.4 The staged pipeline `A2d`
 
 ```
@@ -362,7 +450,21 @@ CADENCE: new uploads continuously (≤ 24 h) · adapters monthly · re-embed the
 - **Quantization:** int8 / FP8 for the query encoder and the reranker: lower-precision weights and activations, so less memory and bandwidth per query; cheaper and faster, **gated on the expert eval set**, since fine-grained distinctions are exactly what quantization erodes first. `F3a`
 - **Cache viral queries:** the same viral clip gets uploaded by thousands of users. Key a cache on the **query's perceptual fingerprint** and skip the whole pipeline on a hit.
 - **MMR on appearance:** `score = λ · action_relevance − (1 − λ) · max appearance-similarity to results already picked`, plus at most N results per channel. `A3b`
-- **Reliability:** if the GPU pool is degraded, serve the **text source** with an honest label rather than failing. `I1b`
+- **Reliability:** if the GPU pool is degraded, serve the **text source** with an honest label rather than failing. `I1b` That's graceful degradation: a weaker but still useful answer instead of an error, stepping down one rung at a time:
+
+  ```
+  TIER 0 · FULL       GPU encode → moment ANN → temporal reranker → diversify
+  TIER 1 · NO RERANK  reranker pool short → ANN order, NO deep-link refinement
+                      (moments start at the proposal's time, not the exact move)
+  TIER 2 · TEXT       query encoder down too → the TEXT SOURCE: a small CPU
+                      captioner names the move ("airflare") → ordinary title /
+                      chapter search · label: "Showing results matched by
+                      description; video matching is temporarily unavailable"
+  TIER 3 · ASK        captioner down too → "Describe the move" box → plain text search
+  ⚠ the label is the point: a text match presented as a motion match would be
+    a silent quality drop. Users and dashboards should both know which tier
+    answered (fallback rate per tier is a monitored SLO)
+  ```
 
 ---
 

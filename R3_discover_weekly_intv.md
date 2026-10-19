@@ -30,8 +30,8 @@
 | **6–9** | **PRODUCT + METRICS** | **(b)**, (h) | The playlist · ⚠ **sticky discoveries, not streams** · skip-through isn't success | I1c, F1b, I2b |
 | **9–12** | **CAPACITY + BUDGETS** | — | Weekly pools ≈ 1.2 TB · ~500 assemblies/s · **the latency budget is two songs long** | A1b, I1a, I1d |
 | **12–22** | **ARCHITECTURE** | **(c)** | Weekly batch → per-user pool → triggered assembly → slate of 10 → prefetch | A2a, A5a, A1c, F2b |
-| **22–32** | **DATA & MODEL** | **(d) (e) (f)** | Reached, not heard · two-tower + multi-task ranker + DPP + exploration bandit | A2b–d, F1a, F1c, F2c |
-| **32–38** | **SERVING** | **(g)** | Prefetch at track 8 · learn from the last ten · availability at play time | F3a, F3b, A3b, I1b |
+| **22–32** | **DATA & MODEL** | **(d) (e) (f)** | Reached, not heard · two-tower + multi-task ranker + DPP (determinantal point process) + exploration bandit | A2b–d, F1a, F1c, F2c |
+| **32–38** | **SERVING** | **(g)** | Prefetch after the 8th track (any order) · learn from the last ten · availability at play time | F3a, F3b, A3b, I1b |
 | **38–44** | **EVAL + ROLLOUT + BIAS** | **(h)** | Future-discovery replay · weekly-cohort A/B · holdback · artist fairness | I2a, I2b, F1c |
 | **44–48** | **PRODUCTION-READINESS SWEEP** | — | Nine dimensions, said as a checklist | I1a–I1j |
 | **48–52** | **EXTENSION + FAILURES** | **(i)** | Conversational steering, context · **taste-cluster fallback** · top 3 failures | F3c, F2a, A5b |
@@ -57,6 +57,10 @@
 ## 1 · REQUIREMENTS *(min 1–6)* — probe **(a)** `A4a` `A1b`
 
 **⚠ Ask these BEFORE you're asked:**
+0. **⭐ "After those 10 songs are played, a new recommendation appears": does it appear right away, or next week?** The prompt can be read both ways, and the answer changes the design:
+   - **Right away** (the assumption below): playlists per user per week = 1 + however many they finish (~3 on average). Assembly is **event-driven**, the next playlist is **prefetched**, skip-farming becomes a risk, and heavy listeners exhaust their pool.
+   - **Next week only:** exactly **1 playlist per user per week**. The two clocks collapse into one weekly batch: no triggered assembly, no prefetch, no skip-farming, no pool exhaustion. The hard parts become novelty and the weekly batch.
+   *(Ask it first. Whichever answer comes back, say what it removes from the design.)*
 1. **What counts as "played" — ten tracks reached, skips included, or ten tracks actually listened to?** *(Decides whether skipping farms new playlists — FU 2.)*
 2. **Does the weekly refresh still happen — and is there a cap on refreshes?** *(The original product's Monday scarcity was part of its pull; an endless refresh can turn it into one more feed.)*
 3. **Are accounts shared — family, a toddler, a party speaker?** *(Taste pollution — FU 7.)*
@@ -129,6 +133,8 @@ ITERATE ON: saves + ≥30 s streams on exploratory slots, weighted
 TRACK:      does the fast proxy still predict the sticky discovery? (G15)
 ```
 
+> **The line for the interview** `F1b` `I2b`: *"With this refresh mechanic, playlists consumed goes up as playlists get worse, so skip-through is a negative label and success is discoveries that stick, not playlists played."*
+
 **The metric stack:**
 
 | Layer | Metric | Role |
@@ -156,12 +162,24 @@ THE REFRESH LOAD:
   a playlist ≈ 10 × 3.5 min ≈ 35 min of listening
   ~10⁸ weekly users × ~3 playlists ≈ 3×10⁸ assemblies a week ≈ ~500/s average,
   several × that on Monday mornings and evenings
+  WHY ~3, NOT 1: the weekly playlist is only the FIRST one. Finishing it
+    triggers a new one, so each listener gets 1 + however many they finish:
+      light listener: the Monday one, maybe not finished           → 1
+      ~1.5 h of Discover a week (≈ 2.5 playlists of listening)     → ~3
+      heavy listener, 3 h a day (FU: pool exhaustion)              → 30+
+    the MEAN is ~3 because the heavy tail pulls it up; the median is 1–2.
+    (Even at exactly 1 per user: 10⁸/week ≈ 165/s, so the conclusion holds:
+    assembly load is small, and the hard part is the weekly batch)
   each assembly: one KV read + re-rank ~500 + pick 10 → tens of ms of CPU
 
 ⭐ THE LATENCY BUDGET IS TWO SONGS LONG:
-  the trigger (reaching track 10) is PREDICTABLE → build the next playlist
-  when track 8 starts → ~7 minutes, not 200 ms
+  the trigger (all 10 tracks reached) is PREDICTABLE → build the next playlist
+  when the 8th DISTINCT track starts → ~7 minutes, not 200 ms
   → latency stops being the constraint; AVAILABILITY and OFFLINE become it
+  ⚠ COUNT TRACKS, NOT POSITIONS: many listeners play on SHUFFLE, so "track 8"
+    can come first. The client counts distinct tracks reached in ANY order
+    (a shuffle repeat doesn't count twice); after the 8th, two remain, so the
+    two-song budget holds whatever the order
 
 ⚠ POOL EXHAUSTION — the heavy-listener problem:
   3 h a day ≈ 5 playlists a day ≈ 350 tracks a week, and the diversity
@@ -200,6 +218,9 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
 │ two-tower ANN over 10⁸ tracks · playlist co-occurrence (PMI-
 │ normalised) · audio neighbours (new tracks) · artist-graph hops ·
 │ new releases
+│   PMI SOURCE: for each track the listener saved or replayed recently,
+│   take its top neighbours by PMI from a precomputed table (weekly,
+│   track → top-200), then drop anything already heard
 │ FILTER: already heard · recommended recently · hidden artists ·
 │         explicit setting · NOT LICENSED in this country
 │ OUTPUT: ~1–2k unheard candidates
@@ -212,7 +233,7 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
 └────────────────────────────────────────────────────────────────
 
 ══ PER PLAYLIST (Monday, or when the current one is nearly done) ═════════════
-┌─ 4. TRIGGER — track 8 of the current playlist starts ──────────
+┌─ 4. TRIGGER — the 8th distinct track starts (any order) ───────
 │ OUTPUT: an assembly request carrying the last playlist's outcomes
 └──────┬─────────────────────────────────────────────────────────
        ▼
@@ -222,7 +243,8 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
 └──────┬─────────────────────────────────────────────────────────
        ▼
 ┌─ 6. SLATE ASSEMBLY — 10 tracks ────────────────────────────────
-│ one per artist · DPP diversity · exploration slots · a quality floor
+│ one per artist · DPP (determinantal point process) diversity ·
+│ exploration slots · a quality floor
 │ · an ORDER that flows (a strong, familiar-adjacent opener)
 │ OUTPUT: 10 tracks + a reason per track + provenance logged
 └──────┬─────────────────────────────────────────────────────────
@@ -265,6 +287,7 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
 ### 5.2 Labels from listening (e) `F1c`
 
 - **Only reached positions count.** A track the listener never got to wasn't heard, so it is **not** a negative — just unexposed.
+- **Log the shuffle state with every play.** In sequential play, position effects (early tracks heard most) distort the labels. **Shuffle is a free randomised experiment:** the order is random, so comparing a track's skip rate in shuffled sessions across positions measures position bias directly, like R1's randomised slice, at no cost.
 - **Skip < 30 s** → negative · **≥ 30 s** → weak positive (also roughly where a play counts as a stream) · **complete** → positive · **save / add / follow** → strong · **re-listen in the next 4 weeks** → the truth, joined late. Fast positives are weighted by how often similar ones became re-listens (G15's bridge).
 - **Context-confounded skips** (car, party, a shared speaker) are down-weighted; sessions the listener excluded from their taste profile are dropped.
 - **Stream fraud is removed** before anything becomes a label (§8).
@@ -274,11 +297,11 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
 
 | Model | Task | Objective |
 |---|---|---|
-| **Two-tower retrieval** | User and track embeddings | Sampled softmax over co-listening, with a **logQ correction** so hits don't dominate |
+| **Two-tower retrieval** | User and track embeddings | Sampled softmax over co-listening, with a **logQ correction** for the sampling bias of in-batch negatives (hits show up as negatives in almost every batch, so uncorrected they're over-penalised). ⚠ A full correction restores true popularity rather than removing it, so for a **discovery** product apply it **partially** (subtract α·log Q, α < 1) and let PMI and the novelty constraint keep the hits out (R4 FU 1) |
 | **Multi-task ranker** | Discovery value per track | Cross-entropy per head; score = P(save or re-listen) minus an early-skip penalty |
-| **Slate selector** | Choose 10 | Greedy selection under hard constraints, with a **DPP** term for diversity |
+| **Slate selector** | Choose 10 | Greedy selection under hard constraints, with a **DPP (determinantal point process)** term for diversity: it scores the 10 tracks **as a set**, rewarding sets whose tracks are each good **and** unlike each other (the determinant of their similarity matrix shrinks when two tracks are near-duplicates) |
 | **Exploration bandit** | How adventurous to be with this listener | **Thompson sampling** on a Beta posterior of exploratory-slot success → 1–4 exploration slots |
-| **Sequencer** | Order the 10 | Transitions scored on tempo, energy and key; a strong opener first |
+| **Sequencer** | Order the 10 | Transitions scored on tempo, energy and key; a strong opener first. **Only matters in sequential play:** on shuffle the client picks the order, so no slot can rely on a strong neighbour, and **every** track must clear the skip-risk floor on its own |
 
 ```
 ⭐ THE SLATE OBJECTIVE — constraints first, then value:
@@ -287,6 +310,148 @@ NEW TRACKS: ~10⁵ a day → audio embeddings computed at ingestion
   THEN:  maximise  Σ P(sticky discovery)  +  diversity (DPP log-det)
   → promises go in constraints; diversity is the one soft term, because it's
     taste quality, not a promise to anyone
+```
+
+**The loss each model optimises:**
+
+```
+NOTATION   u = user-tower vector · e_t = track-tower vector · s(u,t) = u·e_t / τ
+           σ(z) = 1/(1+e^(−z)) · BCE(y, p) = −[ y·log p + (1−y)·log(1−p) ]
+
+1. TWO-TOWER RETRIEVAL: sampled softmax, in-batch negatives, PARTIAL logQ
+   batch of B (listener_i, track_i) DISCOVERY positives: a track heard for the
+   FIRST time that was saved or streamed ≥ 30 s (not replays of old favourites,
+   or the model learns to find the familiar)
+     L_retr = −(1/B) Σ_i w_i · log [ exp(s(u_i,t_i) − α·log Q(t_i))
+                                     / Σ_j exp(s(u_i,t_j) − α·log Q(t_j)) ]
+     w_i  label strength: re-listen 2.0 · save 1.0 · ≥ 30 s stream 0.5
+     α    the popularity dial, 0 < α < 1 for a discovery product (above)
+     mask accidental hits (the same track twice in one batch)
+   WHY "SAMPLED": a FULL softmax would put all 10⁸ tracks in the denominator:
+     10⁸ × 64 ≈ 6×10⁹ multiply-adds per example, ~2.6×10¹³ per batch: infeasible.
+     Instead the denominator uses the positive + a SAMPLE of negatives (here,
+     the other B − 1 rows' tracks): 4,096 × 64 per example. The sample isn't
+     uniform (hits are over-represented), and the −α·log Q term corrects for that
+
+2. MULTI-TASK RANKER: BCE per head, on REACHED tracks only
+   heads k ∈ { stream ≥ 30 s · save · re-listen within 4 weeks · skip < 30 s }
+   a key INPUT feature: the max PMI between the candidate and the listener's
+   recent saves (how strongly "people like you" pair it with what they love)
+     L_rank = Σ_k λ_k · (1/|M_k|) Σ_{i ∈ M_k} ω_i · BCE(y_ik, σ(z_ik))
+     M_k  rows where head k has a label (re-listen: only rows ≥ 4 weeks old)
+     ω_i  0.3 for context-confounded skips (car, party, shared speaker) · 1 else
+     λ_k  per-head training weights
+   + PAIRWISE term within ONE playlist (saved track i > skipped track j):
+     L_pair = −log σ(z_save,i − z_save,j)   → session effects cancel
+   SERVING SCORE: V = P(re-listen) + w_s·P(save) − w_k·P(skip < 30 s)
+
+3. AUDIO ENCODER (LoRA fine-tune): InfoNCE on co-listening pairs (a, b)
+     chosen by PMI, not raw co-count: by raw count almost every pair would be
+     "a hit + something", and the encoder would learn "sounds like a hit"
+     L_audio = −log [ exp(sim(a,b)/τ) / Σ_j exp(sim(a,b_j)/τ) ]
+     → a new track's audio lands near tracks its audience already likes
+
+4. EXPLORATION BANDIT: no gradient loss; a Beta posterior per listener
+     SAY: "A per-listener Thompson-sampling bandit decides how adventurous each
+     playlist should be. It keeps a Beta posterior on how often this listener's
+     exploratory slots succeed, meaning saved or streamed past 30 seconds,
+     decayed weekly. Each playlist, I sample from it: a high sample gives 3–4
+     exploratory slots, a low one gives 1."
+     WHAT A PROBE WOULD ASK, AND WHAT THE LINE ANSWERS
+       what is it deciding?   HOW MANY of the 10 slots are exploratory (1–4),
+                              per listener
+       what's the reward?     an exploratory slot that was saved or streamed
+                              past 30 s
+       what's the posterior?  Beta(α, β), updated each playlist, decayed weekly
+                              as taste drifts
+       why Thompson sampling? it explores in proportion to uncertainty: a new
+                              listener gets varied playlists while the system
+                              learns, and a known-cautious one settles near 1
+     IF THEY PUSH TO DEPTH 3
+       why not ε-greedy?      it explores blindly: the same randomness for a
+                              listener you know well as for one you don't
+       why decay?             taste drifts, so old evidence should fade; it also
+                              keeps the posterior from becoming permanently certain
+       a new listener?        start from a prior for their SEGMENT, not Beta(1, 1)
+     THE UPDATE
+     exploratory slot saved or streamed ≥ 30 s → α ← α + 1, else β ← β + 1
+     (both decayed weekly) · sample θ ~ Beta(α, β) → θ sets 1–4 exploratory slots
+
+5. SLATE SELECTOR: no training loss; it OPTIMISES an objective at serving time
+     maximise over the set S of 10:  Σ_{t ∈ S} V_t + γ·log det(L_S)
+       V_t  track t's VALUE from the ranker (item 2's serving score):
+            P(re-listen) + w_s·P(save) − w_k·P(skip < 30 s)
+       L_S  the 10 × 10 SIMILARITY matrix of the chosen tracks:
+            L_S[i][j] = similarity of tracks i and j (cosine of their
+            embeddings; 1 on the diagonal)
+            log det(L_S) = 0 if the 10 are all unlike each other, and falls
+            toward −∞ as any two become near-duplicates
+       γ    how much diversity is worth against value (tuned online)
+       (here quality sits in Σ V_t, so L_S holds similarity ONLY; the DPP block
+        below folds quality INTO L instead. Use one form or the other, never
+        both, or quality counts twice)
+     subject to the hard constraints (unheard, 1 per artist, licensed, …)
+     solved greedily (the DPP term is unpacked below)
+
+6. SEQUENCER: BCE on "no skip at track j given track i just played"
+     on SEQUENTIAL sessions only (shuffle has no real transitions)
+```
+
+**DPP (determinantal point process), unpacked:** a way to score a **whole set** of items, so that it's high only when the items are each good **and** different from each other.
+
+```
+BUILD A MATRIX L over the candidate tracks:
+  L[i][j] = q_i · S_ij · q_j
+    q_i   track i's quality (its sticky-discovery score)
+    S_ij  similarity of tracks i and j (cosine of their embeddings; S_ii = 1)
+SET SCORE = det(L restricted to the chosen tracks)
+  for two tracks:  det = q_i² · q_j² · (1 − S_ij²)
+  → two near-identical tracks (S ≈ 1) make the determinant collapse toward 0
+
+WORKED EXAMPLE, pick 2 of 3:
+  A  indie folk       q = 0.90
+  B  indie folk       q = 0.85     S(A,B) = 0.9   ← near-duplicate of A
+  C  desert blues     q = 0.70     S(A,C) = S(B,C) = 0.2
+    {A, B}:  0.81 × 0.72 × (1 − 0.81) = 0.11
+    {A, C}:  0.81 × 0.49 × (1 − 0.04) = 0.38   ✅
+    {B, C}:  0.72 × 0.49 × (1 − 0.04) = 0.34
+  → the DPP picks A + C. Top-2 by quality would pick A + B: two of the same.
+
+GEOMETRY: think of each track as a vector, its length = quality, its direction =
+  its style. The determinant is the squared VOLUME the vectors span: long vectors
+  (good tracks) pointing in different directions (different styles) span a lot;
+  two vectors pointing the same way span almost nothing.
+
+IN PRACTICE: greedy, one track at a time; add the track that most increases
+  log det (fast, near-optimal). YouTube has published using DPPs for feed
+  diversity.
+vs MMR (R1): MMR penalises each pick by its similarity to the SINGLE closest
+  track already picked; a DPP judges the redundancy of the WHOLE set at once.
+  MMR is simpler; a DPP is better when the set is the product, as here.
+```
+
+**PMI (pointwise mutual information), unpacked:** how much more often two tracks appear together than they would **by chance**. It's what turns raw co-listening counts into real "listeners of A also like B" signals.
+
+```
+PMI(a, b) = log [ P(a and b together) / ( P(a) · P(b) ) ]
+  > 0  together MORE than chance (a real association)
+  = 0  exactly chance (no association)
+  < 0  together LESS than chance
+
+EXAMPLE over 10⁶ user playlists, seed track S is in 2,000 (P = 0.002):
+  H  a global hit,  in 200,000 playlists (P = 0.2),   together with S in 400
+  N  a niche track, in   1,000 playlists (P = 0.001), together with S in 300
+                     together    chance            ratio    PMI
+  S + H             4×10⁻⁴      0.002×0.2   = 4×10⁻⁴     1      0
+  S + N             3×10⁻⁴      0.002×0.001 = 2×10⁻⁶   150    ≈ 5.0
+  → RAW COUNTS say H is S's best neighbour (400 > 300): the hit is everywhere,
+    so it co-occurs with everything. PMI says N is the real neighbour.
+
+⚠ THE CATCH: PMI over-rewards very rare pairs (two tracks each in 2 playlists,
+  together once, gets a huge PMI from one coincidence) → require a minimum
+  co-count, smooth the counts, or use normalised PMI (NPMI, scaled to −1…1)
+LINK: an uncorrected in-batch softmax learns a PMI-like score (α = 0 in the
+  logQ dial above); the full correction (α = 1) learns raw popularity
 ```
 
 ### 5.4 Fine-tune an existing model (f) `F2c`
@@ -310,7 +475,8 @@ STAGE 6 · LEARN      outcomes → the bandit now · re-listens → next week's 
 
 ```
 THE NEXT PLAYLIST IS BUILT BEFORE IT'S NEEDED:
-  track 8 starts → assemble → push to the device → ready at track 10
+  8th distinct track starts (any order, shuffle included) → assemble →
+  push to the device → ready when the 10th is reached
   offline: download the current AND the next playlist together
   if the listener stops at track 6, the prefetched playlist waits — it
   isn't counted as exposed until one of its tracks starts
@@ -347,13 +513,60 @@ LONG RUN   a holdback on the old system for months: retention and TOTAL
            listening — does discovery grow listening, or cannibalise it?
 ```
 
+**OPE (off-policy evaluation) on exploration slots, unpacked:** estimate how a **new** ranker *would have* done, using logs from the **current** one, before showing it to anyone.
+
+```
+THE INGREDIENT: exploratory slots choose a track AT RANDOM among eligible
+  candidates, and LOG THE PROBABILITY (the propensity) of the track chosen
+    e.g. one exploratory slot picks uniformly among 20 candidates → p = 1/20
+
+THE ESTIMATE (inverse propensity scoring, IPS):
+  V̂(new) = (1/n) Σ_i  [ π_new(track_i) / p_logged(track_i) ] · reward_i
+    π_new     the probability the NEW ranker would pick the track that was shown
+    p_logged  the probability it was ACTUALLY picked with (logged)
+    reward    1 if saved / streamed ≥ 30 s, else 0
+  → re-weights old outcomes toward the tracks the new ranker would choose
+
+WORKED EXAMPLE: 1,000 logged exploratory plays (uniform, p = 0.05)
+  track X shown 50 times, saved 15 (30%) · the other 19 shown 950, saved 95 (10%)
+  old policy (uniform): 110 / 1,000 = 0.11
+  new ranker: picks X half the time, the other 19 share the rest (0.026 each)
+    V̂ = (1/1,000) · [ (0.5/0.05)·15 + (0.026/0.05)·95 ]
+      = (1/1,000) · [ 150 + 50 ] = 0.20
+  sanity check: 0.5 × 30% + 0.5 × 10% = 0.20 ✓
+  → the new ranker roughly DOUBLES the save rate on these slots: it earns an A/B
+
+WHY ONLY EXPLORATION SLOTS: the normal slots are near-deterministic (the top
+  track has p ≈ 1, the rest ≈ 0), so most tracks a new ranker would pick were
+  NEVER shown there, and there's no outcome to re-weight. Randomised slots
+  give every eligible track a chance, so there's data on all of them.
+CAVEATS: weights explode when p is tiny → clip them, or use self-normalised
+  IPS / doubly robust (R7 §7) · it estimates per SLOT, not a whole playlist
+  (slate-level OPE is much noisier) · a SCREEN for which ranker earns an A/B,
+  never the verdict
+```
+
+**Evaluating the exploration slots themselves: five questions, five instruments.** Exploration is meant to cost a little now and pay later, so it's judged on **both** sides.
+
+| Question | Metric | How to read it |
+|---|---|---|
+| **1 · What does it cost now?** | Save rate, ≥ 30 s rate and skip < 30 s on **exploratory vs normal** slots, same playlists | Exploratory should be somewhat lower, **bounded**: a gap that keeps widening means the bandit over-explores |
+| **2 · Does it find anything?** | **Discovery yield**: share of explored tracks and **new artists** that become sticky (saved or re-listened within 4 weeks) | The real payoff per slot; compare by genre and by how far from the listener's taste the slot reached |
+| **3 · Does the system learn from it?** | Explored tracks that **graduate** into normal slots and do well there · the ranker's prediction error on new and tail tracks shrinking | Exploration exists to buy information; if nothing graduates, it's paying for nothing |
+| **4 · Is the bandit sizing it right per listener?** | Exploratory success by **number of slots given** (1 vs 4) · predicted vs observed success per listener (calibration) · skip-through rate by slot count | Adventurous listeners given 4 slots should succeed at least as often as cautious ones given 1; if not, the posterior is mis-set |
+| **5 · Does it pay over months?** | A **long-horizon holdback** with exploration capped at 1 slot: sticky discoveries, retention, **catalogue coverage**, emerging-artist share | Short A/B tests always say "explore less", because the cost lands now and the payoff later. Only the holdback can defend the budget |
+
+**Plus the plumbing and the guardrails:** propensities logged on **100%** of exploratory slots (or OPE becomes impossible) · exploratory tracks never in the opening slot · hides of explored artists and whole-playlist skip-through watched as guardrails · exposure spread across genres, regions and new artists, so exploration isn't quietly concentrated in one corner.
+
+> **Say:** *"I'd judge exploration on cost and payoff together: the save-rate gap against normal slots now, the discovery yield and graduation rate over weeks, and a long-horizon holdback that's the only fair test, because any short test will tell you to explore less."*
+
 **Success** = sticky discoveries per user-week up, novelty and artist diversity held, total listening grown rather than cannibalised, and retention up in the holdback. `I2b`
 
 **Bias sources and mitigations** `F1c`
 
 | Bias | Mechanism here | Mitigation |
 |---|---|---|
-| **Popularity** | Co-listening favours hits | logQ correction; PMI; evaluation by popularity decile |
+| **Popularity** | Co-listening favours hits | PMI-normalised co-listening; a partial logQ correction (α < 1); the novelty constraint; evaluation by popularity decile |
 | **Exposure loop** | Only recommended tracks get feedback | Exploration slots with logged propensities |
 | **Position** | Early tracks are heard most | Reached-only labels; position-aware training |
 | **Skip ambiguity** | Skips reflect context as well as taste | Context down-weighting |
@@ -421,7 +634,7 @@ a new listener, a polluted or fraud-hit history, or a failed personal pool
 > First, a definition I'd want settled up front: does a skip count as "played"? If it does — the natural reading and the simpler product — then skipping becomes a way to farm new playlists, and the system acquires a perverse incentive: **playlists consumed per week rises as playlists get worse**. So two rules. **Skip-through is a strong negative**, never an engagement win, and playlist count is never a success metric. And **the next playlist responds**: fewer exploratory slots, a safer opener closer to their known taste, the skipped tracks' neighbours pushed down. If they skip through again, I'd stop pretending and ask — "Not in the mood for something new?" — and offer a familiar mix, because sometimes the right discovery playlist is no discovery today. What I would not do is let one bad evening rewrite a year of taste: session feedback shapes the next slate within minutes, while the long-term profile moves weekly.
 
 **3. "How is the next playlist ready the instant the tenth song ends?"** `F2b` `A1b`
-> Because the trigger is predictable, the latency budget is far larger than it looks. When track 8 starts, I assemble the next ten — read the listener's pool, apply what the last eight tracks taught us, pick and order the slate — and push it to the device. That leaves about two songs, roughly seven minutes, for work that takes tens of milliseconds, so latency stops being the constraint and **availability** becomes it: the device should already hold the next playlist, which also makes it work in a car or on a plane. The heavy parts — taste modelling, retrieval over a hundred million tracks, scoring a few hundred candidates — already ran in the weekly batch. Two edge cases worth naming: if the listener stops at track 6, the prefetched playlist simply waits and isn't counted as exposed until one of its tracks starts; and if assembly fails, the device falls back to the pool's top ten under the same rules, so a backend hiccup never produces a repeat or a blank.
+> Because the trigger is predictable, the latency budget is far larger than it looks. When the eighth distinct track starts, in whatever order, since many people listen on shuffle, I assemble the next ten — read the listener's pool, apply what the last eight tracks taught us, pick and order the slate — and push it to the device. That leaves about two songs, roughly seven minutes, for work that takes tens of milliseconds, so latency stops being the constraint and **availability** becomes it: the device should already hold the next playlist, which also makes it work in a car or on a plane. The heavy parts — taste modelling, retrieval over a hundred million tracks, scoring a few hundred candidates — already ran in the weekly batch. Two edge cases worth naming: if the listener stops at track 6, the prefetched playlist simply waits and isn't counted as exposed until one of its tracks starts; and if assembly fails, the device falls back to the pool's top ten under the same rules, so a backend hiccup never produces a repeat or a blank.
 
 **4. "How do you turn scores into a ten-song playlist?"** `A2a` `F1a`
 > As a slate rather than a top ten, because the listener judges the ten together. **Hard constraints first**: all unheard, one track per artist, licensed in their country, their explicit setting, and a ceiling on predicted early-skip for every slot. **Exploration slots**: a per-listener bandit decides how many of the ten sit deliberately further from their taste — Thompson sampling on how their past exploratory slots went — so an adventurous listener gets three or four and a cautious one gets one. **Diversity** across the rest through a determinantal point process, which rewards a set whose tracks are good *and* different from each other, so you don't get ten near-identical indie-folk songs. Then **order**: open with the highest-confidence track closest to their known taste, because an early skip ends the session; smooth the transitions in tempo, energy and key; spread the exploratory slots out rather than bunching them. It's a small combinatorial problem and greedy selection is good enough — and every slot logs where it came from, which powers both the explanation and the evaluation.
@@ -507,7 +720,7 @@ a new listener, a polluted or fraud-hit history, or a failed personal pool
 | **F1b** | Metrics and their trade-offs | §2, FU 1, 6 | *"Playlists consumed goes up when playlists get worse."* |
 | **F1c** | Bias sources and mitigations | §5.2, §7, FU 7 | Popularity, exposure loop, skip ambiguity, artist gender and region, households |
 | **F2a** | Something fails → a fallback | §9, FU 2 | Taste-cluster pipeline; a familiar mix after skip-through |
-| **F2b** | Latency too tight → design for it | §3, §4, FU 3 | Prefetch at track 8, raised **before** being asked |
+| **F2b** | Latency too tight → design for it | §3, §4, FU 3 | Prefetch after the 8th distinct track (shuffle-safe), raised **before** being asked |
 | **F2c** | Fine-tune an existing model | §5.4, FU 5 | A LoRA-tuned audio encoder on co-listening pairs |
 | **F3a** | Efficiency with a quality trade | §6 | Weekly pools + a cheap session re-rank; int8 embeddings |
 | **F3b** | Scale levers | §3, §6 | Sharded pools; per-region batch; mid-week top-ups |
