@@ -388,6 +388,140 @@ INTERLEAVE for ranker-vs-ranker (fast, low variance)
 HOLDOUT    long-term (months): retention, exploration payoff, novelty vs habit (D7 vs D28)
 ```
 
+### 7.6 Bias sources and mitigations — *name them before you're asked (F1c)*
+
+| Bias | Mechanism | Mitigation | Sheets |
+|---|---|---|---|
+| **Position** | Top slots get clicked because they're seen, not because they're better | Randomised slice → κ per slot → **IPS** weights in training; **shallow position tower**, dropped at serving | R1, R2, R4, R5, G13 |
+| **Selection / exposure** | Only shown items have labels; beliefs about unshown items are never tested | **Exploration slice** with logged propensities; OPE (IPS / SNIPS / doubly robust) | R3, R7, G13, Q26 |
+| **Popularity / feedback loop** | Shown → clicked → trained on → shown more; the catalogue narrows | Partial **logQ** (α < 1); PMI; quotas; diversity in candidate generation; downsample head items; coverage and concentration monitors | R1, R3, R4, R5, G17 |
+| **Sampling** (in-batch negatives) | Popular items appear as negatives in most batches | **logQ correction**; mixed (uniform) negatives; mask accidental hits | R1, R3, R4 |
+| **Duration / length** | Long items accumulate more seconds | Duration-quantile label; length-normalised dwell | R4, R7 |
+| **Delayed labels** | Recent impressions look like negatives before their outcome arrives | Matured windows; a fast-proxy bridge; label-wait windows; delay modelling | R5, R6, R7, G15, G22 |
+| **Context-confounded signals** | Skips in a car, at a party or on a shared speaker don't reflect taste | Down-weight by context; honour "exclude from my taste profile" | R3 |
+| **Response bias** | Who answers a survey isn't random | Weight each answer by 1 / P(response) | R4 |
+| **Leakage** | Features computed after the event make offline metrics too good | Point-in-time joins; log features at serving | R6 |
+| **Evaluation-set bias** | Synthetic questions copy the source text; gold sets drift from real queries | Paraphrase step; re-weight to real query types; a human-written core | R8 |
+| **Judge bias** | LLM judges favour longer answers, certain positions, their own model family | Claim-level judging; order swaps; a different model family; κ against humans | R8, Q12 |
+| **Group / representation** | Models are weaker for some groups, languages or creators | Slice every metric by group; augment; exposure audits; per-segment calibration | R2, R5, R8, G25, G29 |
+
+**Two "propensities" that get confused:**
+
+| | **Examination propensity κ_pos** (position bias) | **Action propensity p(a\|x)** (the bandit kind) |
+|---|---|---|
+| **Means** | The chance a user **looks at** slot k | The chance the **policy chose** this item |
+| **Where it comes from** | **Estimated per slot** from the randomised slice: shuffle the order, measure tap rate by position | **Logged per decision**, because the policy itself was random |
+| **Used in** | Position-bias correction (R1, R4) | Off-policy evaluation (R3, R7) |
+
+> **In p(a|x):** **x** is the **context**, everything known when the decision is made (the user's features, the seed or surface, time, device, and the candidates on offer). **a** is the **action**, the item the policy chose to show. So p(a|x) is *"the probability that, in this context, the policy picked this item"*. E.g. R7: x = this user, now, with candidates {A, B, C, D}; the bandit shows C with p(C|x) = 0.55, and that 0.55 is logged.
+
+**Two "random slices" that get confused:**
+
+| | **Randomised slice** | **Exploration slice** (R3, R7) |
+|---|---|---|
+| **What's random** | The **order** of items the ranker already chose | **Which items** are shown |
+| **Fixes** | **Position** bias | **Selection** bias: items never shown have no labels |
+| **Logged** | A "shuffled" flag | A propensity per decision |
+
+**The shallow position tower, said correctly:**
+
+| Get this right | Why |
+|---|---|
+| The tower's input is **position and context only** (slot, surface, device), **never item features** | Given item features, it would learn item quality too, and steal what the main ranker should learn |
+| It trains on **every shown impression**, clicked (1) and not clicked (0), not just the clicks | It learns how much each **slot alone** raises or lowers the click rate |
+| Its logit is **added** to the main ranker's, and both train **jointly** | They share one gradient (p − y); the tower soaks up the slot effect, the ranker learns usefulness |
+| At serving, **drop the tower**, or equivalently score every candidate "as if in slot 1" | The tower's output is the same constant for every candidate, so it can't change the order |
+| The **probability** still needs calibrating (isotonic) | Slot-1 click rates overstate what lower slots get, and value scores multiply p_click into every term |
+
+> **Say:** *"During training I add a shallow tower whose input is only the position and context: slot, surface, device. Its logit is added to the main ranker's, and both train together on every shown impression. The position tower soaks up how much the slot alone changes the click rate, so the main ranker learns how good the item is for this user, without that bias. At serving I drop the position tower and rank every candidate on the main ranker's score, which is the same as scoring them all as if they were in slot 1."*
+>
+> **If they push:** ~10% dropout on the slot feature, so the model doesn't over-rely on it · **the catch:** the old ranker put better items higher, so slot and quality are correlated and the tower can absorb some real quality; check its learned per-slot values against log κ from the randomised slice.
+
+```
+THE CHECK, run after every retrain:
+  LEARNED PER-SLOT VALUE = what the tower outputs for each slot, with context fixed
+    feed slot = 1, 2, … 10 → z_pos(1) … z_pos(10); take each relative to slot 1:
+    Δ_k = z_pos(k) − z_pos(1)          ("slot k costs this much logit")
+  κ_k = the EXAMINATION PROPENSITY of slot k, relative to slot 1, measured on the
+    randomised slice (order shuffled, so item quality is equal in every slot):
+    κ_k = click rate in slot k ÷ click rate in slot 1
+  THEY SHOULD MATCH: for small click rates σ(z) ≈ e^z, so the tower's effect is
+    e^{Δ_k}, which should equal κ_k  →  Δ_k ≈ log κ_k
+
+  e.g. slot 4: randomised slice says κ₄ = 0.30 → log κ₄ = −1.20
+    tower learned Δ₄ = −1.2   ✅ it captured position, and only position
+    tower learned Δ₄ = −1.9   ⚠ it blames slot 4 for MORE of the click drop than
+      position causes: in normal logs, slot 4 also held WORSE items (the old
+      ranker put them there), and the tower soaked up that quality gap
+      → the main ranker then over-rates the items the old ranker ranked low
+  THE FIX if it fails: train the tower on the shuffled slice too, or skip
+    learning it and FIX z_pos(k) = log κ_k as a known offset
+```
+
+> **Say:** *"Position bias and selection bias need different tools: a shuffled-order slice estimates how often each slot is seen, while an exploration slice with logged propensities is the only way to learn about items the ranker never showed."*
+
+### 7.7 The calibration pipeline at serving — *from a raw score to a probability you can multiply*
+
+```
+1. RANKER          z = the click head's logit, POSITION TOWER DROPPED
+                   p = σ(z)     ("click probability as if in slot 1", trained
+                                 on DOWNSAMPLED negatives, so ~1/r too high)
+
+2. UNDO THE        p' = p / ( p + (1 − p)/r )
+   DOWNSAMPLING      r = the FRACTION OF NEGATIVES KEPT in training
+                         (keep 1 non-click in 10 → r = 0.1; positives all kept)
+                   same thing in logit space:  z' = z + log r   (a constant shift)
+                   e.g. p = 0.092, r = 0.1 → p' = 0.010
+
+3. ISOTONIC        p'' = iso(p')   a monotone step function fitted on FRESH,
+   CALIBRATION                     UNSAMPLED data: bucket by p', measure the
+                                   real click rate, merge order violations (PAVA)
+                   · fits PER HEAD, and often per surface or market
+                   · fixes what step 2 can't: drift, over-confidence, a model
+                     that's systematically off in some score range
+                   · ⚠ fit it on the SAME score you'll apply it to (p' here)
+
+4. DOWNSTREAM      ads:   eCPM = p''(click at slot k) × bid
+                   recs:  the value score multiplies p'' into every term
+```
+
+**Isotonic calibration, worked through:**
+
+```
+FIT: 10,000 fresh, UNSAMPLED impressions, bucketed by the corrected score p'
+  bucket (p')     impressions   clicks   real click rate
+  B1 0.00–0.02       4,000         40        1.0%
+  B2 0.02–0.05       3,000         90        3.0%
+  B3 0.05–0.10       1,500         39        2.6%   ⚠ LOWER than B2: an order
+                                                       violation (noise)
+  B4 0.10–0.20       1,000         80        8.0%
+  B5 0.20–1.00         500         90       18.0%   ⚠ the model's scores here
+                                                       average ~0.30: over-confident
+
+POOL ADJACENT VIOLATORS (PAVA): merge B2 + B3, weighted by impressions:
+    (90 + 39) / (3,000 + 1,500) = 129 / 4,500 = 2.87%
+
+THE MAP (must never go DOWN as the score goes up):
+  p' in B1 → 1.0%  ·  B2 or B3 → 2.87%  ·  B4 → 8.0%  ·  B5 → 18.0%
+
+SERVE:
+  candidate X: p' = 0.07 (in B3) → p'' = 2.87%
+  candidate Y: p' = 0.30 (in B5) → p'' = 18%   (the model said 30%: corrected down)
+  → Y still ranks above X: isotonic never swaps the order, only fixes the NUMBERS
+  in practice: hundreds of buckets (or PAVA on individual points), with linear
+  interpolation between them so similar scores get similar probabilities
+```
+
+**Three points to get right:**
+
+| Point | Why |
+|---|---|
+| **Steps 2 and 3 overlap.** If isotonic is fitted on the raw p using unsampled data, it learns the downsampling shift too, and step 2 becomes redundant | Most systems keep both: step 2 is exact and free, so isotonic only has to fix the smaller, residual errors |
+| **Isotonic does not remove position bias.** That happens in **training** (the shallow tower or IPS) | Calibration makes the number honest; it doesn't make the model learn usefulness |
+| **The model's p means "as if in slot 1"**, because the tower was dropped. When the actual slot matters (ads pricing, expected clicks), multiply back: p(click at slot k) ≈ p(slot 1) × κ_k | So calibrate against slot-1 impressions, or fit with the slot term included and remove it after |
+
+> **Say:** *"The ranker's score is trained on downsampled negatives and with position removed, so at serving I first undo the downsampling with p/(p + (1−p)/r), then apply an isotonic map fitted per head on fresh unsampled data. Only then is it a probability I can multiply by a bid or blend with other heads; and position bias was handled earlier, in training."*
+
 ---
 
 ## PART 8 · RECOGNISE THE ARCHETYPE — *any prompt maps to one of nine*
@@ -426,6 +560,71 @@ LATENCY       typeahead ~50 ms · search / feed 100–200 ms P95 · async sugges
               · a bandit selection layer ≤ 10 ms · LLM generation: hundreds of ms+
               → if an LLM is in the path, say how its latency is HIDDEN (streaming, prefetch)
 ```
+
+### 9.1 Hardware numbers — *for on-the-fly compute and memory maths*
+
+> Order-of-magnitude figures for planning in an interview, not spec sheets. **Units:** 1 FMA (fused multiply-add, `a×b + c`) = **2 FLOPs**. GPU figures are **dense** (no sparsity); vendors often quote the 2× "sparse" number.
+
+**CPU (one modern x86 server):**
+
+| | One core | One socket (e.g. 64–96 cores) |
+|---|---|---|
+| **Compute, FP32** | AVX2 ≈ 16 FMA/cycle × 3 GHz ≈ 5×10¹⁰ FMA/s ≈ **100 GFLOP/s** peak (AVX-512 ≈ 2×); ~10¹⁰ FMA/s realistic in simple loops | **~3–6 TFLOP/s** peak |
+| **DRAM bandwidth** | **~10–20 GB/s** streamed by one core | **~100–300 GB/s** (newest DDR5 servers ~400–600) |
+| **Cache** | L1 ~32–48 KB · L2 ~1–2 MB | **L3: tens to a few hundred MB** |
+| **DRAM size** | — | Hundreds of GB to a few TB |
+
+**GPU (one accelerator):**
+
+| | **A100** (80 GB) | **H100** (SXM) | **H200** | **B200** |
+|---|---|---|---|---|
+| **BF16 / FP16 tensor, dense** | **312 TFLOP/s** | **~990 TFLOP/s** | ~990 TFLOP/s | **~2,250 TFLOP/s** |
+| **FP8 tensor, dense** | — | **~1,980 TFLOP/s** | ~1,980 TFLOP/s | ~4,500 TFLOP/s |
+| **FP32, non-tensor** | 19.5 TFLOP/s | ~67 TFLOP/s | ~67 TFLOP/s | — |
+| **Memory (HBM)** | **80 GB** | **80 GB** | **141 GB** | **~180–192 GB** |
+| **Memory bandwidth** | **~2.0 TB/s** | **~3.35 TB/s** | ~4.8 TB/s | ~8 TB/s |
+| **GPU-to-GPU (NVLink)** | 600 GB/s | 900 GB/s | 900 GB/s | 1.8 TB/s |
+
+**Links, storage and latency:**
+
+```
+PCIe Gen4 x16 ≈ 32 GB/s · Gen5 ≈ 64 GB/s        (CPU ↔ GPU)
+datacentre network 100–400 Gb/s ≈ 12–50 GB/s per NIC (÷ 8 for bytes!)
+NVMe SSD ≈ 3–7 GB/s sequential · ~10–100 µs per random read
+LATENCY  L1 ~1 ns · L2 ~4 ns · L3 ~10–40 ns · DRAM ~100 ns
+         same-datacentre round trip ~0.5 ms · cross-region ~50–150 ms
+REALISTIC UTILISATION  training MFU ~30–50% of peak · simple CPU loops ~10–20%
+```
+
+**The rules of thumb that use them:**
+
+```
+WHICH LIMIT? (the roofline) compare work per byte against the hardware's ratio
+  ridge point = peak FLOP/s ÷ bandwidth
+    H100: 990×10¹² ÷ 3.35×10¹² ≈ 300 FLOP per byte read
+    one CPU core: ~10¹¹ ÷ 1.5×10¹⁰ ≈ 7 FLOP per byte
+  a dot-product scan does 2 FLOPs per 4 bytes read (0.5 FLOP/byte) → far below
+  either ridge → MEMORY-BOUND: time ≈ bytes ÷ bandwidth
+
+SCAN TIME         bytes ÷ bandwidth
+                  13 MB on one CPU core ≈ 0.9 ms · 512 MB ≈ 35 ms (why R1 needs ANN)
+LLM PREFILL       ≈ 2 × params × prompt tokens FLOPs → COMPUTE-bound
+                  7B model, 6k tokens: 2 × 7×10⁹ × 6×10³ = 8.4×10¹³ FLOPs
+                  → H100 at ~40% of 990 TFLOP/s ≈ 0.2 s to first token
+LLM DECODE        each token reads all the weights → MEMORY-bound at small batch
+                  ceiling ≈ bandwidth ÷ weight bytes per token
+                  7B in BF16 = 14 GB → H100 3.35 TB/s ÷ 14 GB ≈ 240 tokens/s per
+                  sequence (batching shares one weight read across many sequences)
+KV CACHE          2 × layers × KV heads × head dim × bytes, per token
+TRAINING FLOPs    ≈ 6 × params × training tokens
+                  e.g. 7B on 2×10¹² tokens = 8.4×10²² FLOPs
+                  → ÷ (990×10¹² × 40% MFU) ≈ 2×10⁸ GPU-seconds ≈ 59,000 H100-hours
+DOES IT FIT?      params × bytes: 70B in BF16 = 140 GB → 2 H100s for weights alone;
+                  training with Adam ≈ 16 bytes per parameter (weights, gradients,
+                  2 moments, fp32 master copy) → 70B ≈ 1.1 TB → shard it
+```
+
+> **How to use it live:** state the bytes or FLOPs, divide by the right figure, round, and say the regime. E.g. *"13 MB per scan, one core reads about 15 GB/s, so under a millisecond, and it's memory-bound, so int8 is the first lever."*
 
 ---
 
@@ -553,7 +752,7 @@ SHORT ON TIME   protect §8 and the success definition
 | **CTR / acceptance rate** | Clicks or taps per impression. The **available** metric, gameable, never the north star alone | R1, R4, R5, R6, R7, G13, G2 |
 | **Downstream completion** | Did the conversation or task the click started actually succeed? | R1 |
 | **Dismiss / hide / "not interested" rate** | Explicit negative feedback per impression | R1, R4, R5, R6, R7, G14 |
-| **Retention: D7 / D28, return rate** | Share of users active again 7 / 28 days later, or returning next week | R1, R6, G13, G14, R4 (7-day return) |
+| **Retention: D7 / D28, return rate** | Of users active on day 0, the share active again 7 / 28 days later (e.g. 1M on day 0 → 420k on day 7 = D7 42%). Read against a **long-term holdout**: a gain at D7 that's gone by D28 was **novelty**; one that survives to D28 is **habit** | R1, R6, G13, G14, G15, R4 (7-day return), R7 (next-day return) |
 | **Survey satisfaction · regret rate** | "Was this worth your time?": the direct satisfaction label | G13, R4 |
 | **Satisfied watch time** | Watch time weighted by predicted satisfaction | R4 |
 | **Watch-through · successful-search rate** | The user found it: watched past the matched part, saved, or rewatched | G2, R2 |

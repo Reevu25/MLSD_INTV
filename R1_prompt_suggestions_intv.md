@@ -529,7 +529,9 @@ WHY TWO TOWERS: the prompt side never depends on the request, so 10⁶ prompt
   The price: the towers meet only in a dot product, so they can't model fine
   context × prompt interactions. That's the ranker's job.
 WHY APPROXIMATE: exact search streams 10⁶ × 128 × 4 B = 512 MB of vectors per
-  request, which is tens of ms and memory-bound, over the 15 ms budget. ScaNN
+  request, which is tens of ms and memory-bound, over the 15 ms budget.
+  (~35 ms at one core's ~15 GB/s; and at ~35k QPS peak that's ~18 TB/s of
+  reads, ~90 CPU sockets doing nothing but scanning.) ScaNN
   partitions the space into clusters, searches only the few nearest ones, and
   scores compressed vectors: ~1–3 ms at ~95–99% recall of the exact top-200.
   → recall@200 against exact search is a tracked offline metric

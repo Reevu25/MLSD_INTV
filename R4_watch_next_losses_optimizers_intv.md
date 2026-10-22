@@ -81,13 +81,15 @@
 | Assumption | Value |
 |---|---|
 | Surfaces | **Up-next list (~20)** + **the autoplay pick** (the top slot, played when the video ends) |
-| Scale | ~10⁹ videos · ~5×10⁹ watch-page loads a day · ~1.5×10⁵ QPS at peak |
+| Scale | ~10⁹ videos · ~5×10⁹ watch-page loads a day · ~1.5×10⁵ QPS at peak. A **watch-page load** is one opening of a video's page (from a click, a search result, a shared link or autoplay); each one requests a fresh up-next list, so loads = watch-next requests. 5×10⁹ ÷ 86,400 s ≈ 6×10⁴ QPS average, ~2.5× at peak |
 | Objective | **Satisfied watch time**: click × duration-debiased watch × satisfaction, minus the negatives, **inside named guardrails** |
 | Personalisation | Watch history and subscriptions, respecting activity settings; none on made-for-kids content |
 | Freshness | A new upload is **eligible within ~1 hour** (after transcoding and policy classifiers) |
 | Training | Daily warm-start from yesterday's checkpoint, plus near-line updates for fresh-video embeddings |
 
 **FR:** seed-conditioned candidates from several sources · multi-task ranking · re-ranking for diversity relative to the seed and the session · an autoplay pick with a stricter bar · a reason per card · controls (*Not interested*, *Don't recommend channel*, autoplay off) that act on the next load.
+
+> **Seed-conditioned:** the **seed** is the video currently on screen, and *seed-conditioned* means each candidate source uses that video as its starting point. For example, co-watch finds what people watched after this video, content-similar finds videos like it, and the two-tower query takes it as input, so every candidate is chosen in relation to what the viewer is watching right now, not just their general history.
 
 **NFR / SLO:**
 
@@ -98,6 +100,10 @@
 | Freshness | Upload → eligible **≤ 1 h**; the fresh index updated in minutes |
 | Availability | 99.9%; on failure, a **degraded but relevant list** (the seed-only path), never an empty panel |
 | **Guardrails (ship blockers)** | Survey satisfaction · regret rate · dismiss rate · borderline impressions · new-creator reach · autoplay-chain drift |
+
+> **Autoplay-chain drift:** how far a sequence of autoplayed videos wanders from where it started: after 5 or 10 automatic hops, how different is the topic from the first video, and how much closer has it moved to borderline content? Each hop can look locally reasonable while the chain as a whole slides somewhere harmful (the "rabbit hole"), so it's measured directly, as topic distance and borderline score k hops from the seed, and a rise is a ship-blocking guardrail.
+>
+> **Borderline content:** videos that don't break the platform's rules, so they aren't removed, but come close: sensational misinformation, extreme diets, conspiracy theories, shock content. A **policy classifier** scores how close each video is to the line, and those videos are demoted or capped in recommendations rather than removed, because recommending them is the platform's choice even when hosting them is allowed.
 
 **Scope / NON-GOALS:**
 - ❌ **Optimising clicks or raw watch time.** Position: clicks reward thumbnails; raw watch time rewards long and sensational videos (G13's six pathologies).
@@ -141,16 +147,76 @@ cannot learn that a watch was unwanted):
     → clickbait inflates the first factor; model the two separately
 ```
 
+**Why not make the north star "total normalised watch time"?** Normalising **per video** is right for the **label** (§5.3 trains on the watch time's quantile among videos of similar length). But **summing** normalised values as the business metric swaps one bias for the opposite one:
+
+```
+SESSION A: one 30-min video, watched 90%         raw = 27 min   Σ normalised = 0.9
+SESSION B: ten 2-min videos, each watched 50%    raw = 10 min   Σ normalised = 5.0
+  raw minutes say A is 2.7× better · Σ normalised says B is 5.5× better
+  B looks like flicking through half-watched clips; A is a viewer engrossed
+
+  RAW MINUTES          → LONG-VIDEO bias: the system learns "longer is better"
+  Σ NORMALISED         → FRAGMENTATION bias: the system learns "more, shorter,
+                         half-watched videos per session", which rewards
+                         clickbait and short-form churn
+```
+
+**So split the jobs:**
+- **Rank** with the per-video normalised label (the duration quantile), so a 4-minute video and a 40-minute one compete fairly for the same slot.
+- **Measure** with **satisfied watch time**: real minutes, weighted by predicted satisfaction. Minutes keep the value of attention honest; satisfaction stops long-but-regretted watches from counting.
+- **Report alongside it:** satisfied watches per session (a count), so a launch that wins minutes by pushing only long videos, or wins count by fragmenting sessions, shows up on one of the two.
+
+> **Say:** *"Normalising per video is right for the label, but summing normalised watch time rewards fragmenting sessions into half-watched clips. So I rank on the normalised label, and measure satisfied minutes with satisfied watches per session beside it, so neither bias can win unseen."*
+
 **The metric stack:**
 
 | Layer | Metric | Role |
 |---|---|---|
 | **North star** | **Satisfied watch time** from watch-next (watch time weighted by the satisfaction model, validated against surveys) + **7-day return** | Value that lasted |
 | Engagement | CTR · duration-debiased watch · likes, shares · autoplay continue rate | Proximate, read **with** the guardrails |
-| Offline | Recall@k (retrieval) · per-head AUC, **normalised entropy** and **calibration** (ranker) | **Screens, never decides** (§7) |
+| Offline | Recall@k (retrieval) · per-head AUC, **normalised entropy** and **calibration** (ranker) · **precision@k and NDCG@k** of the final order (on the randomised slice) | **Screens, never decides** (§7) |
 | **Guardrails** | Regret · dismiss · abandon < 10 s · borderline impressions · new-creator reach · **autoplay-chain drift** · p95 latency | **Ship blockers** |
 
 > **Say:** *"Clicks are the available signal; satisfied watch time is the meaningful one. The ladder gives me one label per rung, and Part 2 gives each label its own loss."*
+
+**How satisfaction is measured: ask a few, predict for everyone.**
+
+```
+1. ASK A RANDOM FEW (the ground truth, sparse)
+   after a watch, a small RANDOM sample of viewers sees a survey card:
+   "Was this video worth your time?"  1 ★ … 5 ★  (or "I regret watching this")
+   · random, so it isn't only asked after good or bad watches
+   · ⚠ RESPONSE BIAS: who answers isn't random → weight each answer by
+     1 / P(this kind of viewer answers), estimated from who sees vs who answers
+
+2. PREDICT FOR EVERYONE (the SATISFACTION MODEL)
+   trained on the survey answers, from signals every watch has:
+     + watch quantile for the video's length · like · share · save ·
+       subscribe after the watch · came back to the channel later
+     − dismiss · "don't recommend channel" · abandon < 10 s · rewound away
+   output: E[satisfaction] for every watch, not just the surveyed ones
+   (§5.3: a 5-class softmax → its expected score, distilled into a ranker head)
+
+3. WEIGHT WATCH TIME BY IT
+   satisfied watch time = Σ watch time × predicted satisfaction (scaled 0–1)
+     scaling: the model predicts an expected rating from 1 to 5 stars →
+              (rating − 1) / 4, so 1 ★ → 0, 3 ★ → 0.5, 5 ★ → 1
+   e.g. one session, two watches:
+                      watched   predicted rating   scaled   satisfied minutes
+     video A (rant)    20 min        1.5 ★          0.125    20 × 0.125 = 2.5
+     video B (guide)    4 min        5.0 ★          1.0       4 × 1.0   = 4.0
+     raw watch time:      A = 20, B = 4   → A looks 5× better
+     satisfied minutes:   A = 2.5, B = 4  → B counts MORE, with a fifth of the time
+   → a 20-minute regretted watch counts for little; a 4-minute great one counts fully
+
+4. KEEP IT HONEST
+   · held-out surveys: predicted vs actual satisfaction (calibration), monthly
+   · the survey itself is a STANDING experiment: its question, sample rate and
+     placement are fixed and versioned, or the metric drifts with the UI
+   · cross-check against 7-day return: satisfied viewers should come back
+```
+
+> **Say:** *"I measure satisfaction directly with a random survey card, correct for who answers, train a model on those answers to predict satisfaction for every watch, and weight watch time by it, so a regretted 20-minute watch counts for little."*
 
 ---
 
@@ -210,6 +276,16 @@ MEMORY (this drives Part 3):
        dismissals, autoplay cancels, survey answers
    → labels (§5.3) → daily warm-started training: two-tower · MMoE ranker
  ITEM TOWER → a vector per video → ANN INDEX (daily) + FRESH TIER (streaming, minutes)
+   DAILY:  the towers retrain (warm start) → a NEW embedding space → re-embed
+           EVERY video, old and new, with the new item tower → build a new main
+           index offline → swap it in ATOMICALLY with the matching query tower
+           (vectors from two tower versions aren't comparable: never mix them)
+   FRESH:  a video uploaded since the last rebuild is embedded with the
+           CURRENT item tower (the same version as the main index) and upserted
+           into a small streaming index within minutes
+   QUERY:  search BOTH indexes with the same query vector, merge by score
+   NEXT DAY: fresh videos are folded into the rebuilt main index, and the fresh
+           tier starts empty again
  CO-WATCH TABLE: seed → top-200 next-watched, PMI-normalised (hourly)
  UPLOAD PIPELINE: transcode → policy classifiers → content embedding → FRESH TIER
 
@@ -268,17 +344,111 @@ MEMORY (this drives Part 3):
 | **User** | History pooled with attention **to the seed** (which past watches matter for *this* video), subscriptions, device, time |
 | **Context** | Surface (list vs autoplay), **position: training only**, through the shallow tower |
 
+**Two kinds of history, used differently:**
+
+| | **Long-term history** | **This session** |
+|---|---|---|
+| **What it is** | The last ~100 watches across weeks | The videos watched in the last few minutes, **before** the seed |
+| **Tells you** | Who this viewer is: their tastes | What they're doing **right now** |
+| **Freshness** | Refreshed roughly daily | **Within seconds**: R6's nearline path, plus the client sending its last few watched IDs with the request in case the stream lags |
+
+**Where the user's history is used, stage by stage:**
+
+```
+WHAT'S FETCHED (one read per request, ~20 ms): the last ~100 watches (video IDs,
+  watch quantile, when) · subscriptions · dismissed videos and channels
+
+⭐ TWO KINDS OF HISTORY, used differently:
+  LONG-TERM   the last ~100 watches across weeks: who this viewer is
+              → refreshed daily-ish; personalises tastes
+  THIS SESSION the videos watched in the last few minutes, BEFORE the seed:
+              what they're doing right now
+              e.g. "Python decorators" → "Python generators" → seed "Python
+              async": the session says they're working through a topic, so
+              "Python asyncio tutorial" beats "Python memes"
+              → must be FRESH: streamed into the feature store within seconds
+                (R6's nearline path), and the client also sends its last few
+                watched IDs with the request in case the stream lags
+
+  SESSION FEATURES IN RETRIEVAL: the two-tower query encodes the seed AND the
+    session sequence (attention over the last ~5 session watches), so retrieval
+    follows the thread, not just the one video on screen
+  SESSION FEATURES IN RANKING: session length · topics and channels this
+    session · average watch quantile this session (engaged or flicking?) ·
+    similarity of the candidate to the session's videos · time since the
+    session started
+  SESSION IN RE-RANK: MMR against the seed AND everything watched this session;
+    autoplay-chain drift is measured over the session's hops
+
+1. CANDIDATES
+   · TWO-TOWER QUERY: q = f(history, seed, context): history POOLED into the
+     query vector, so retrieval leans toward this viewer's tastes around the seed
+   · SUBSCRIPTIONS source: new uploads from channels they follow (small quota)
+   · FILTERS: drop videos watched recently, and dismissed videos and channels
+
+2. RANKER
+   · TARGET ATTENTION over history: weight each past watch by its relevance to
+     THIS candidate (a cooking history matters for a recipe video, not a
+     football one), then pool → a user vector per candidate
+   · USER × CANDIDATE features: watched this channel before? usual watch
+     quantile for it? affinity to its topic? dismissed something similar?
+
+3. RE-RANK
+   · MMR against the seed AND the videos watched this session, so the list
+     doesn't repeat what they just saw
+   · autoplay-chain drift measured over the session's history of hops
+
+4. EXPLANATION: "Because you watched X" comes from the history item that
+   drove the pick
+
+NOT USED: signed out, incognito or paused history → the SEED-ONLY pipeline (§9)
+  · made-for-kids content · sensitive watches never appear in reasons
+PRIVACY: history is READ AT REQUEST TIME, not baked into a per-user ID
+  embedding, so deleting it changes recommendations immediately (§8)
+```
+
 ### Serving, efficiency and the re-rank objective `F3a` `A3b` `I1b`
 
 - **Efficiency** `F3a`: item vectors are precomputed; only the query tower runs per request. **int8** ANN vectors halve or quarter index memory at a small recall cost, gated on recall@k. The **pre-ranker is distilled** from the ranker, which trades a little quality on the tail of the 2,000 for 4× fewer heavy scorings.
 - **The re-rank objective** `A3b`: greedy MMR, `pick v maximising  λ·score(v) − (1−λ)·max_{u ∈ {c} ∪ S} sim(v, u)`, where S is the set already picked and **the seed c is in the set from the start**. Then hard constraints: ≤ 2 per channel, borderline demoted, kids rules.
+
+  ```
+  SYMBOLS   v       a candidate video
+            score   its additive value score from the ranker (§5.4)
+            S       the videos already picked for the list, in order
+            c       the SEED: the video on screen
+            {c} ∪ S the seed plus everything picked so far
+            sim     cosine similarity of two videos' content embeddings
+            max     the CLOSEST of them: a candidate is penalised by the one
+                    video it repeats most
+            λ       the knob: 1 = pure relevance, 0 = pure novelty (start ~0.7)
+
+  WORKED EXAMPLE, seed c = "Lisbon travel vlog, Day 1", λ = 0.7:
+                                         score   sim to c
+    A "Lisbon vlog, Day 2"                0.95     0.80   (same series, new content)
+    B "Porto food guide"                  0.80     0.50
+    C "Lisbon vlog, Day 1 (re-upload)"    0.85     0.99   (the same video again)
+    D "Portugal history explainer"        0.60     0.40
+    pick 1 (compare with c only):
+      A = 0.7·0.95 − 0.3·0.80 = 0.425 ✅   B = 0.410   C = 0.298   D = 0.300
+    pick 2 (compare with c and A): B stays 0.410 ✅ (closest is still c, 0.50)
+    pick 3: D = 0.300 edges C = 0.298, and C's re-upload is deduped anyway
+  → MMR shows A, B, D. Top-3 by score would show A, C, B: the video the viewer
+    has just finished, offered again.
+  WHY THE SEED IS IN THE SET: without it, C would only be compared with the
+    other picks, and a copy of the video on screen would look perfectly novel.
+  ```
 - **The autoplay pick** is the top of the list **only if** it clears a stricter bar: P(satisfaction) ≥ τ_auto, not borderline, not a near-duplicate of the seed. Otherwise the next one that does.
 - **Reliability** `I1b`: each source has a timeout and its quota refills from the others; if user features time out → the **seed-only pipeline** (§9); if the ranker is down → the cached per-seed list. **Never an empty panel.**
 
 ### ⚠ Raise these yourself, before the interviewer does `F2b` `A1c` `F2a`
 
-- **The latency squeeze** `F2b` `A1c`: *"If 500 candidates don't fit in 45 ms, I won't shrink the ranker for everyone. I'd tighten the distilled pre-ranker and cache seed-only candidates for head seeds, so the heavy model only scores what it must."*
-- **Popularity collapse** `F2a`: *"My retrieval loss has a logQ correction, which **restores** the popularity prior rather than removing it. If the list converges on the same popular videos, that term is the dial (FU 1)."*
+- **The latency squeeze** `F2b` `A1c`: *"Say the full ranker can't score 500 candidates inside its 45 ms. The easy fix, a smaller ranker for everyone, lowers quality on every request, so I wouldn't do that. Instead I'd make the heavy ranker score fewer candidates, and free up time elsewhere:"*
+  1. **Send it fewer candidates.** The pre-ranker is a small model trained to imitate the ranker. Let it cut 2,000 candidates to 300 instead of 500, so the ranker does 40% less work. I'd check the cost offline: how often the ranker's own top 20 still survives the pre-ranker's cut.
+  2. **Reuse work for popular videos.** When millions of people watch the same video, the seed-only candidate sources (co-watch, content-similar, next in series) return the same list for all of them. So for the most-watched seeds, I'd compute that list once an hour and cache it. Those requests skip most of retrieval, and the milliseconds saved go to the ranker.
+  - *"Either way the heavy model stays the same size; it just scores only the candidates that need it."*
+- **Popularity collapse** `F2a`: *"My retrieval loss has a logQ correction, which **restores** the popularity prior rather than removing it. If the list converges on the same popular videos, I turn that correction into a dial: subtract α·log Q instead of log Q, and lower α below 1 to keep a mild popularity penalty (FU 1)."*
+  - **The dial, spelled out:** α = 1 is the full correction, and the model learns the true next-watch distribution, which **is** dominated by popular videos. α = 0 is no correction, and in-batch negatives over-penalise popular videos (a PMI-like score). Values in between set how much popularity retrieval keeps. α is tuned on recall sliced by popularity decile and on new-creator reach online.
 - **The hour-old upload:** *"A new video has no ID embedding and no co-watch, so it enters through content similarity in a streaming fresh tier, with a funded exploration quota (FU 2)."*
 - **Autoplay chains:** *"Each autoplay hop is locally optimal and the chain can still drift somewhere bad, so trajectory drift is a monitored guardrail, not an afterthought (FU 4)."*
 
@@ -347,6 +517,39 @@ WHAT I TRAIN: in-batch sampled softmax, with logQ correction and reward weights
     → a clickbait "positive" carries almost no weight
 ```
 
+**What one batch looks like** (B = 4 here; ~4,096 in practice):
+
+```
+EACH ROW = one logged next-watch:  (who, on which seed)  →  the video they watched next
+  row 1: user Asha,  seed "Lisbon vlog Day 1"   →  v1 "Lisbon vlog Day 2"
+  row 2: user Ben,   seed "Python decorators"   →  v2 "Python generators"
+  row 3: user Chen,  seed "Champions League"    →  v3 "Top 10 goals 2026"   ← a HIT
+  row 4: user Dee,   seed "Football tactics"    →  v4 "Top 10 goals 2026"   ← the SAME hit
+
+QUERY TOWER encodes each row's (user, seed) · ITEM TOWER encodes each row's video
+SCORE TABLE  s(row i, video j), every query against every video in the batch:
+
+               v1 Lisbon2   v2 generators   v3 Top10   v4 Top10
+  q1 Asha     [  4.2  ]        0.1            0.9        0.9
+  q2 Ben         0.0        [  3.9  ]         0.4        0.4
+  q3 Chen        0.6           0.2         [  3.1  ]     ✗ masked
+  q4 Dee         0.5           0.3           ✗ masked  [  3.4  ]
+
+  DIAGONAL       = the 4 positives (what each row actually watched next)
+  OFF-DIAGONAL   = negatives for free (another row's next-watch)
+  ✗ MASKED       = an "accidental hit": v3 and v4 are the same video, so for
+                   Chen, v4 is NOT a negative; it's the very video they watched
+
+THEN, PER COLUMN, subtract α·log Q(video):
+  "Top 10 goals" is in a huge share of rows (Q ≈ 10⁻³ → −log Q ≈ 6.9)
+  "Python generators" is rare            (Q ≈ 10⁻⁷ → −log Q ≈ 16.1)
+  → the hit appears as a negative in almost every batch; this term stops the
+    model learning "always push hits down" from that alone
+
+EACH ROW IS A 4-WAY CHOICE:  softmax over the row → the target is its diagonal
+  row 1 pushes 4.2 UP and 0.1, 0.9, 0.9 DOWN; the 0.9s (a confusable hit) harder
+```
+
 **The bias that sampling introduces, and what the correction does.** This is the part interviewers probe:
 
 ```
@@ -403,12 +606,130 @@ y_watch = F_{d(v)}( T )
   d(v)     v's duration bucket (e.g. 30 log-spaced buckets of video length)
   F_d      the empirical CDF of T among clicked impressions in bucket d
 → "this watch was in the 80th percentile FOR VIDEOS THIS LONG"
+
+WORKED EXAMPLE: build F_d per bucket from last week's clicked impressions
+                              percentiles of seconds watched (T)
+  bucket                      10%     25%     50%     75%     90%
+  d1 = 3–5 min videos         15 s    45 s   110 s   190 s   240 s
+  d2 = 30–45 min videos       60 s   180 s   540 s  1,200 s 1,900 s
+
+  watch                                   T        bucket   y_watch = F_d(T)
+  a 4-min video, watched 190 s           190 s       d1        0.75
+  a 40-min video, watched 190 s          190 s       d2        ≈ 0.26
+  a 40-min video, watched 20 min       1,200 s       d2        0.75
+  → the SAME 190 s is a good watch of a short video and a poor one of a long one
+  → 190 s of a 4-min video and 20 min of a 40-min video get the SAME label,
+    so neither length wins just by having more seconds
+  (between the listed percentiles, interpolate; the buckets are refreshed weekly)
+
+IN THE LOSS: each training row uses the CDF of ITS OWN video's bucket
+  row i = one clicked impression of candidate v_i, with T_i seconds watched
+    1. d_i = d(v_i)        from v_i's length (metadata), e.g. 4 min → d1
+    2. y_i = F_{d_i}(T_i)  look up T_i in THAT bucket's table → the soft label
+    3. p_i = σ(z_i)        the watch head's prediction for (user, seed, v_i)
+    4. ℓ_i = −[ y_i·log p_i + (1 − y_i)·log(1 − p_i) ]
+  a batch mixes buckets freely:
+    row 1  4-min video,  T = 190 s   → F_d1(190)   = 0.75
+    row 2  40-min video, T = 190 s   → F_d2(190)   ≈ 0.26
+    row 3  40-min video, T = 1,200 s → F_d2(1,200) = 0.75
+  · the CDF tables are FROZEN and versioned per training run, or the labels
+    would shift under the model mid-training
+  · at serving, no lookup: the head predicts the quantile directly (video
+    length is one of its input features, so it can learn length effects)
+
+ONE POPULAR VIDEO = MILLIONS OF ROWS, and that's intended
+  every clicked impression is its OWN row: (user, seed, context, video, T)
+    Asha on seed X watched v for 190 s  → y = 0.75
+    Ben  on seed Y watched v for  40 s  → y = 0.12
+  the features differ row to row, so the head learns E[y | user, seed, v]:
+  who watches THIS video deeply, after WHICH seed. Collapsing v's rows into one
+  averaged label would throw that away and leave a per-video quality score
+  · BCE's minimiser is the conditional MEAN, so rows with identical features
+    and different T simply teach their average
+  · but a hit would flood the batches → CAP rows per video per day (and per
+    user), the same downsampling as R1's head prompts
+
+⚠ WHY F_d IS PER LENGTH BUCKET, NOT PER VIDEO
+  F_d is built from ALL clicked impressions of ALL videos in the bucket.
+  A per-VIDEO CDF would give every video an average label of exactly 0.5:
+  a gripping video and a dull one would look identical, and the head could
+  never learn which videos people watch deeply. Per BUCKET, a gripping
+  4-min video averages ~0.8 and a dull one ~0.3, so quality differences
+  survive while the length bias is removed
   removes duration bias (cf. D2Q, KDD 2022); bounded in [0,1], so BCE applies
   · completion ratio min(T/len, 1) is the tempting alternative: it is biased
     toward SHORT videos, which complete easily
 ```
 
 **The classic alternative, and why I don't use it as the main head** (FU 5 derives it): YouTube's 2016 weighted logistic regression weights **positives by watch time T** and negatives by 1. Its learned odds are `e^z ≈ E[T per impression]`. That's elegant, but it multiplies P(click) into the target (so clickbait leaks in), it grows with video length, and the approximation breaks when CTR isn't small.
+
+**The three watch-time losses, written out side by side:**
+
+```
+T = seconds watched · z = the head's logit · p = σ(z) · ŷ = a regression output
+
+1. WEIGHTED LOGISTIC REGRESSION (YouTube 2016), on ALL impressions
+     L = −Σ_i w_i · [ y_i·log p_i + (1 − y_i)·log(1 − p_i) ]
+       y_i = 1 if clicked, 0 if not · w_i = T_i for clicked rows, 1 otherwise
+     serving: e^z ≈ expected watch time PER IMPRESSION
+     gradient: ∂L/∂z = w·(p − y)  → a 3-hour watch pushes 10,800× harder
+     ✗ multiplies in P(click) (clickbait leaks in) · grows with video length
+
+2. MSE ON LOG-SECONDS, on CLICKED rows only
+     L = (1/N) Σ_i ( ŷ_i − log(1 + T_i) )²
+       ŷ_i = the watch-time head's RAW output for row i: one linear output
+             unit, no sigmoid, any real number. It's the model's prediction
+             of log(1 + seconds watched) for this (user, seed, candidate),
+             e.g. ŷ = 5.2 means it expects e^5.2 − 1 ≈ 180 s (3 minutes)
+       N   = the number of clicked rows in the batch
+       log(1 + T): the +1 handles T = 0; the log tames the heavy tail
+       (30 s and 3 h become ~3.4 and ~9.3 instead of 30 and 10,800)
+     serving: e^ŷ − 1 ≈ the geometric-mean watch time GIVEN a click
+     gradient: ∂L/∂ŷ = 2·(ŷ − log(1 + T))  → bounded by the log, not by seconds
+     ✓ separates click from watch · ✗ still longer video = more seconds = higher
+       target; and e^ŷ under-estimates the arithmetic mean (log is concave)
+
+3. ⭐ DURATION-QUANTILE SOFT-LABEL BCE (the choice), on CLICKED rows only
+     L = −Σ_i [ y_i·log p_i + (1 − y_i)·log(1 − p_i) ],  y_i = F_d(v_i)(T_i) ∈ [0, 1]
+     serving: p ≈ the expected watch QUANTILE for a video of this length
+     gradient: ∂L/∂z = p − y  → bounded by 1, whatever the video length
+     ✓ separates click from watch · ✓ removes the length bias · ✓ stable gradients
+
+WHICH TO SAY: "Weighted LR is the classic and learns watch time per impression,
+  but it mixes in the click and rewards length. MSE on log-seconds separates the
+  click and tames the tail, but still rewards length. The duration quantile with
+  BCE fixes both, with a gradient bounded by one."
+```
+
+**The pairwise ranking loss: an extra term on the click head.** The up-next list is a **choice** among ~20 videos shown together, so besides "was this video clicked?" (pointwise BCE), train "was this video preferred over that one, in the same list?":
+
+```
+PAIRS, from ONE shown list (the same user, seed and moment):
+  i = a video CLICKED and watched well   j = a video shown ABOVE it, or just
+  below it, and NOT clicked (seen and passed over; never pair with videos
+  below the scroll depth: unseen isn't rejected)
+  + QUALITY pairs: a clicked video watched deeply (y_watch high) > a clicked
+    video abandoned within 10 s, from the same list
+
+LOSS (RankNet form; s = the ranker's score, here the click-head logit z):
+  L_pair = − Σ_pairs  w_ij · log σ( s_i − s_j )
+    w_ij = 1/κ of i's slot (IPW: a click from a low slot is stronger evidence)
+           × |ΔNDCG_ij| for the LambdaRank variant (pairs that would move a
+             video across the top of the list matter more)
+
+GRADIENT, per pair, with Δ = s_i − s_j:
+  ∂L/∂s_i = −w_ij · (1 − σ(Δ))      push the preferred video UP
+  ∂L/∂s_j = +w_ij · (1 − σ(Δ))      push the passed-over video DOWN
+  → already-correct pairs (Δ ≫ 0, σ ≈ 1) contribute almost nothing; the
+    gradient concentrates on pairs the ranker currently gets WRONG
+
+WHY ADD IT: everything shared by the whole list (a user who clicks a lot, a
+  late-night session, a hugely popular seed) cancels in s_i − s_j, so the
+  model learns which video beats which, not which sessions are clicky
+WHY NOT ONLY PAIRWISE: it fixes the ORDER, not the SCALE, and the value score
+  multiplies p_click into every term, so p_click must be a real probability
+  → L_click = BCE + β·L_pair (β ~ 0.1–1, tuned), then isotonic calibration
+```
 
 ### 5.4 Combining several objectives into one training loss `F1a` `A2b`
 
@@ -433,15 +754,68 @@ TWO SETS OF WEIGHTS — DON'T CONFUSE THEM:
         score(v) = p_click · ( w_watch·ŷ_watch + w_like·p_like + w_sat·p_sat
                                − w_abandon·p_abandon )  −  w_dismiss·p_dismiss
         additive in the heads → every pick decomposes into what drove it (§8, I1j)
+        e.g. one candidate, heads:  p_click 0.20 · ŷ_watch 0.7 · p_like 0.1 ·
+             p_sat 0.8 · p_abandon 0.05 · p_dismiss 0.02
+             weights: w_watch 1 · w_like 0.5 · w_sat 1 · w_abandon 2 · w_dismiss 3
+          watch         0.20 × 1.0 × 0.7  = +0.14
+          satisfaction  0.20 × 1.0 × 0.8  = +0.16
+          like          0.20 × 0.5 × 0.1  = +0.01
+          abandon       0.20 × 2.0 × 0.05 = −0.02
+          dismiss              3.0 × 0.02 = −0.06
+          SCORE                           =  0.23
+        → each head adds or subtracts its own term, so "why was this picked?"
+          has an answer (satisfaction and watch drove it), and a weight change
+          has a predictable effect (raise w_dismiss → risky videos drop)
 
 ARCHITECTURE FOR CONFLICTING HEADS: MMoE
   f_k(x) = h_k( Σ_e g_ke(x) · E_e(x) ),   g_k(x) = softmax(W_k x)
   E_e experts shared by all heads; g_k each head's own gate → click and dismiss
   can lean on different experts instead of fighting over one shared bottom
+
+  THE PROBLEM IT SOLVES: with ONE shared bottom network, every head's gradient
+    lands on the same weights. The click head wants features like "eye-catching
+    thumbnail"; the dismiss head wants "this disappoints". They pull the shared
+    layers in opposite directions, and each head gets worse (§6.2's ∂L/∂h)
+
+  MMoE (multi-gate mixture of experts):
+                        x = features of (user, seed, candidate)
+                                         │
+            ┌──────────────┬─────────────┼─────────────┬──────────────┐
+            ▼              ▼             ▼             ▼
+       EXPERT E₁      EXPERT E₂     EXPERT E₃     EXPERT E₄     (4 small MLPs,
+       → 128-d        → 128-d       → 128-d       → 128-d        SHARED by all heads)
+            └──────────────┴──────┬──────┴─────────────┘
+              each HEAD has its OWN GATE: a softmax over the 4 experts, computed
+              from x, so the mix can change per request
+                gate_click(x)   = [0.60, 0.30, 0.05, 0.05]
+                gate_dismiss(x) = [0.05, 0.10, 0.25, 0.60]
+                                  │
+     click input   = 0.60·E₁ + 0.30·E₂ + 0.05·E₃ + 0.05·E₄  → TOWER h_click   → logit
+     dismiss input = 0.05·E₁ + 0.10·E₂ + 0.25·E₃ + 0.60·E₄  → TOWER h_dismiss → logit
+
+  SYMBOLS
+    x       the input features            E_e(x)  expert e's output vector
+    g_k(x)  head k's gate: softmax(W_k·x), one weight per expert, summing to 1
+    Σ_e g_ke·E_e   head k's own weighted mix of the experts
+    h_k     head k's small tower: its mix → that head's logit
+  → experts specialise during training (one may learn "attractiveness", another
+    "disappointment"); each head draws mainly on the experts that help it, so
+    gradients that would conflict land mostly on different experts. Heads that
+    AGREE (click, like) can still share the same experts
   (the architecture of YouTube's "Recommending What Video to Watch Next", RecSys 2019)
 
 CALIBRATION, because the blend multiplies probabilities:
   negatives downsampled at rate r → correct:  p = p' / ( p' + (1 − p')/r )
+    r   the FRACTION OF NEGATIVES KEPT in training (all positives are kept)
+        e.g. CTR ≈ 1%, so 99% of rows are non-clicks; keep 1 in 10 → r = 0.1
+        (saves ~90% of training compute, at little cost to what's learned)
+    p'  what the model predicts: it trained on data with 10× fewer negatives,
+        so its probabilities come out ~10× too high
+    p   the corrected, real-world probability
+    WHY THE FORMULA: dropping negatives multiplies the odds by 1/r, so
+      odds = r · odds'  →  p = r·p' / (r·p' + 1 − p')  =  p' / (p' + (1 − p')/r)
+    CHECK: true CTR 1% → training CTR ≈ 1 / (1 + 99·0.1) ≈ 9.2%
+           model says p' = 0.092 → p = 0.092 / (0.092 + 0.908/0.1) = 0.010 ✓
   then isotonic per head on a fresh window; monitor predicted/observed per head
 ```
 
@@ -456,6 +830,21 @@ OPTION A · SHALLOW POSITION TOWER (what I'd ship)
   · at SERVING: drop z_bias (position is unknown before ranking anyway)
   · z_bias absorbs ≈ log κ_pos (exact in the small-CTR limit, where σ(z) ≈ e^z)
   · gradient: ∂ℓ/∂z_main = ∂ℓ/∂z_bias = p − y   (additive logits share it)
+  ⚠ THE TOWER'S INPUT IS POSITION AND CONTEXT ONLY, NEVER ITEM FEATURES: given
+    item features it would learn item quality too, and steal it from z_main
+  ⚠ TRAINED ON EVERY SHOWN IMPRESSION (clicked = 1 and not clicked = 0), not
+    just the clicks: it learns how much each slot raises or lowers the click rate
+  · "scores as if in slot 1" and "drop z_bias" rank identically: z_bias is the
+    same constant for every candidate, so it can't change the order. For the
+    PROBABILITY, the value score needs it calibrated (isotonic, §5.4), because
+    slot-1 click rates overstate what lower slots will get
+  SAY: "During training I add a shallow tower whose input is only the position
+    and context: slot, surface, device. Its logit is added to the main ranker's,
+    and both train together on every shown impression. The position tower soaks
+    up how much the slot alone changes the click rate, so the main ranker learns
+    how good the video is for this user, without that bias. At serving I drop
+    the position tower and rank every candidate on the main ranker's score,
+    which is the same as scoring them all as if they were in slot 1."
 
 OPTION B · INVERSE PROPENSITY SCORING (unbiased, if κ is right)
   ℓ_IPS = −[ (y/κ_pos) · log p + (1 − y/κ_pos) · log(1 − p) ]
@@ -463,6 +852,37 @@ OPTION B · INVERSE PROPENSITY SCORING (unbiased, if κ is right)
   · κ_pos estimated from a small RANDOMISED-SWAP slice (swap slot 1 with slot k)
   · ⚠ (1 − y/κ) < 0 when y = 1 → negative weights, high variance
     → clip κ ≥ κ_min, and use it on the click head only
+
+  IPS FOR THE PAIRWISE TERM (§5.3), the unbiased learning-to-rank form:
+    L_pair_IPS = − Σ_{(i, j)}  ( 1 / κ_pos(i) ) · log σ( s_i − s_j )
+      (i, j)     i clicked and watched well · j shown ABOVE i (or just below)
+                 and not clicked, from the same list
+      κ_pos(i)   the examination propensity of the slot i was clicked in
+      s_i, s_j   the click-head logits of the two videos
+    gradient:  ∂L/∂s_i = −(1/κ_pos(i)) · (1 − σ(s_i − s_j)) = −∂L/∂s_j
+    WHY i's SLOT: the click is the position-biased event. A video clicked from
+      slot 6 (κ = 0.25) beat the videos above it despite being seen by only a
+      quarter as many people, so its pairs count 4×. j needs no weight: it sat
+      ABOVE the click, so it was almost certainly seen and passed over
+    e.g. list: slot 1 A (skipped) · slot 2 B (skipped) · slot 3 C (CLICKED, κ₃ = 0.4)
+      pairs C > A, C > B, each weighted 1/0.4 = 2.5
+      L = −2.5·log σ(s_C − s_A) − 2.5·log σ(s_C − s_B)
+    · clip κ ≥ κ_min here too; and with LambdaRank, multiply in |ΔNDCG_ij|
+  · WHICH LOSS: here the click head is POINTWISE (BCE), so IPS changes its
+    target to y/κ_pos as above. With a PAIRWISE ranker instead (R1), weight
+    each (clicked > skipped) pair by 1/κ of the CLICKED item's slot
+  · WHICH PROPENSITY: κ_pos is an EXAMINATION propensity, estimated per SLOT
+    from the randomised slice. It is NOT a per-decision logged propensity
+    (that's the bandit kind, R3/R7, logged because the policy itself was random)
+  · at SERVING: nothing changes. IPS only re-weights TRAINING examples (and
+    offline evaluation); the trained model scores every candidate with no
+    position input and no weights, exactly like a model trained without IPS
+
+BOTH TOGETHER ("shallow tower, plus IPS on the randomised slice"):
+  the RANDOMISED SLICE (a few % of traffic with shuffled order) gives
+  unbiased κ_pos estimates and clean labels → use it to (a) check that the
+  shallow tower's learned z_bias matches log κ_pos, and (b) evaluate the
+  click head without position bias. Neither step touches serving
 
 WHICH HEADS NEED IT: the CLICK head. Post-click heads (watch, like, abandon) are
   conditioned on the click and far less position-dependent.
@@ -568,6 +988,7 @@ THE SAME RESULT, FOR EVERY VARIANT IN §5:
   IPS click head, target y/κ_pos:          ∂ℓ/∂z = p − y/κ_pos
   shallow tower, z = z_main + z_bias:      ∂ℓ/∂z_main = ∂ℓ/∂z_bias = p − y
   5-class survey softmax, π = softmax(z):  ∂ℓ/∂z_j = π_j − 1[j = label]
+  pairwise (RankNet), Δ = s_i − s_j:       ∂ℓ/∂s_i = −(1 − σ(Δ)) = −∂ℓ/∂s_j
   retrieval, P_ij = softmax_j(s_ij − log Q_j):
                                            ∂L_i/∂s_ij = (ρ_i/B) · (P_ij − 1[i = j])
       → ∂L_i/∂q_i = (ρ_i/(Bτ)) · ( Σ_j P_ij · e_vj − e_vi ):
@@ -584,6 +1005,48 @@ WHY IT MATTERS:
 ```
 
 ### 6.3 Sparse vs dense parameters — *"sparse and dense parameters"* `F3b`
+
+**The intuition first: the two kinds of parameter live completely different lives.**
+
+```
+AN EMBEDDING TABLE is a giant address book: 3×10⁸ rows, one per video
+  each training step touches only the ~10⁵ rows whose IDs are in the batch
+  · a HEAD video's row is updated almost every step
+  · a TAIL video's row is updated once every few THOUSAND steps
+  → the problem: a rare row gets very few chances to learn, and it must make
+    the most of each one; a frequent row has had plenty and should settle
+
+ADAGRAD fits that life exactly:
+  each row keeps ONE running total of how much it has been pushed so far
+  step size = η / √(that total)
+  · tail row: small total → BIG steps → it learns a lot from its few examples
+  · head row: huge total  → small, steady steps → it stops wobbling
+  → like a teacher who gives more attention to the student who rarely speaks
+  and it costs one number per row: +1.2 GB on a 77 GB table
+
+ADAM on the same table goes wrong three ways:
+  1. MEMORY: two numbers per COORDINATE (m and v) → +154 GB, triple the table
+  2. MOMENTUM KEEPS COASTING: after a row's last appearance, its momentum still
+     moves it for tens of steps with no new evidence, like a car rolling on with
+     nobody on the pedal (and every step then touches the whole table)
+     · "lazy" Adam avoids that by freezing momentum between visits, but then a
+       row seen once a month resumes with month-old momentum
+  3. MOMENTUM IS MEANT TO AVERAGE A STREAM OF GRADIENTS, and a tail row doesn't
+     have a stream; it has an occasional single example
+
+DENSE LAYERS (the ranker's MLPs, MMoE experts, gates, heads) live the
+OPPOSITE life:
+  EVERY weight gets a gradient from EVERY example in EVERY step
+  → momentum now has a real stream to smooth, so ADAM's averaging helps
+  → layers have very different gradient sizes; Adam's per-weight scale evens them out
+  → only ~10⁷–10⁸ weights, so Adam's extra memory is affordable
+  → bias correction keeps the first steps sane; ADAMW's decoupled weight decay
+    regularises every weight at the same rate (FU 3)
+
+ONE LINE: "Embeddings are sparse and power-law: Adagrad gives rare rows big steps
+  and frequent rows small ones, in one number per row. Dense layers see a
+  gradient every step, so Adam's momentum and per-weight scaling pay off."
+```
 
 | | **Embedding tables (sparse)** | **Dense layers** (towers, MMoE experts, gates, heads) |
 |---|---|---|
@@ -635,6 +1098,11 @@ OFFLINE SCREENS (time-split: train to day N, test on day N+1)
               and for fresh videos separately (an average hides the collapse)
   ranker      per-head AUC · normalised entropy (BCE ÷ entropy of the base rate)
               · calibration (predicted/observed per head, per surface)
+              · precision@k (share of the top k that were satisfied watches)
+                and NDCG@k (graded by satisfaction, so order inside k counts),
+                both on the RANDOMISED slice: in normal logs only the items the
+                OLD ranker put on top have labels, so a new ranker's top k is
+                mostly unlabelled
   slate       seed-duplicate rate · intra-list diversity · channel concentration
   counterfactual  SNIPS on the exploration slice with logged propensities
 
@@ -678,6 +1146,22 @@ LONG RUN    a ~1% holdback on the old system for months: return rate, satisfacti
 | **Popularity** | Positives are popularity-heavy by construction | Tune the correction strength (FU 1); popularity-sliced recall; quotas |
 | **Duration** | Long videos accrue seconds | Duration-quantile label |
 | **Autoplay default** | Autoplay "plays" without a choice | Its own label (continued, not cancelled) and its own head |
+
+**Two "propensities" that get confused:**
+
+| | **Examination propensity κ_pos** (position bias) | **Action propensity p(a\|x)** (the bandit kind) |
+|---|---|---|
+| **Means** | The chance a user **looks at** slot k | The chance the **policy chose** this item |
+| **Where it comes from** | **Estimated per slot** from the randomised slice: shuffle the order, measure tap rate by position | **Logged per decision**, because the policy itself was random |
+| **Used in** | Position-bias correction (R1, R4) | Off-policy evaluation (R3, R7) |
+
+**Two "random slices" that get confused:**
+
+| | **Randomised slice** | **Exploration slice** (R3, R7) |
+|---|---|---|
+| **What's random** | The **order** of items the ranker already chose | **Which items** are shown |
+| **Fixes** | **Position** bias | **Selection** bias: items never shown have no labels |
+| **Logged** | A "shuffled" flag | A propensity per decision |
 
 ---
 

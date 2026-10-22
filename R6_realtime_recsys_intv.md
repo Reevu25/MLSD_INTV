@@ -101,7 +101,7 @@
 
 > **"'Real-time' is three different freshness problems with very different costs: fresh features, fresh items, and fresh model weights. Most of the value comes from the first. A user's last few clicks, streamed into features within seconds, change the next recommendation more than retraining every minute would. So I'd make features and the item catalogue real-time, update weights incrementally on a schedule behind a quality gate, and keep true per-event learning for the few things that need it: new items' exploration statistics and the hide list.**
 >
-> **Second, the numbers change the design. Tens of thousands of items is small: all their embeddings fit in about 13 MB. So every serving machine holds the whole catalogue in memory, and retrieval is an exact dot product over all of it in a couple of milliseconds, with no approximate search and no recall loss. The 100 ms budget goes on features and the ranker.**
+> **Second, the numbers change the design. The prompt's tens of thousands of candidate items, even though they change over time, is small: all their embeddings fit in about 13 MB, and the changes are just a few thousand adds and removes a day. So every serving machine holds the whole catalogue in memory, and retrieval is an exact dot product over all of it in a couple of milliseconds, with no approximate search and no recall loss. The 100 ms budget goes on features and the ranker.**
 >
 > **Third, at a 100 ms P95, the design is as much about what happens when something is slow as when it's fast. Every dependency has a deadline and a fallback, so the user always gets a list, and the fallback is the baseline model I'd build first anyway."**
 
@@ -112,7 +112,9 @@
 ## 1 · REQUIREMENTS *(min 1–5)* — probe **(a)** `A4a` `A1b`
 
 **⚠ Ask these BEFORE you're asked:**
+0. **What's the product, and which surface?** A short-video feed, a shopping home screen, a news app, a single "for you" card? *(Decides the labels (watch vs purchase vs read), how many items each response shows, how much exploration is tolerable, and whether a bad item costs a scroll or a whole slot. Assume a mobile-app feed showing 20 items per request.)*
 1. **What are the items, and how fast do they churn?** Short videos, products, news, deals? *(Decides how fast new items must become recommendable. Assume ~10% of the catalogue turns over per day.)*
+1b. **Are the "tens of thousands of candidate items" the WHOLE catalogue, or what an upstream retriever hands us per request?** *(⭐ This one changes the architecture. If it's the whole catalogue, all embeddings fit in ~13 MB, so every server holds them in memory and retrieval is an exact dot product, with no ANN index. If it's a per-request slice of a far larger catalogue, there's an upstream retrieval system to design or assume. Assume the whole catalogue, changing by a few thousand items a day.)*
 2. **Which interactions must be reflected in the very next response?** *(A hide or a purchase: always. A click: within seconds. A purchase-driven taste shift: within the hour. This sets the freshness tiers.)*
 3. **What's the objective?** Engagement, conversion, retention? *(Assume a blend, with retention as the gate.)*
 4. **Is the 100 ms at the service layer only?** *(Assume yes: from request arrival to response, excluding the mobile network.)*
@@ -136,7 +138,7 @@
 | What | SLA |
 |---|---|
 | **Service latency** | **P95 < 100 ms**, P99 < 200 ms |
-| **Event → online feature** | **≤ 10 s** P95 |
+| **Event → online feature** | **≤ 10 s** P95: *freshness*, from the user's tap to the updated feature being readable (client → event bus → stream processor → online store). Not the same as the store's **read** latency, ~10 ms, inside the request. The gap is covered by the client sending its last few events with each request |
 | **Hide / purchase → effect** | **The next response** (read-your-writes) |
 | **New item → recommendable** | **≤ 5 min** after it passes policy checks |
 | **Item removal → gone everywhere** | **≤ 1 min**, including caches |
@@ -155,10 +157,39 @@
 **What the user sees, and why real-time matters to them:**
 
 ```
+   09:02 · OPENS THE APP                      09:03 · AFTER 2 TAPS + PULL TO REFRESH
+ ┌─────────────────────────────┐            ┌─────────────────────────────┐
+ │  ↓ pull to refresh          │            │  ↓ refreshed just now       │
+ │ ┌─────────────────────────┐ │            │ ┌─────────────────────────┐ │
+ │ │ ▶ Easy weeknight pasta  │⋮│            │ │ ▶ Trail running: hills  │⋮│
+ │ │ Because you watched      │ │            │ │ Because you just watched │ │
+ │ │ "One-pot meals"          │ │            │ │ "Trail running basics"   │ │ ← SESSION
+ │ └─────────────────────────┘ │            │ └─────────────────────────┘ │   signal,
+ │ ┌─────────────────────────┐ │            │ ┌─────────────────────────┐ │   seconds old
+ │ │ ▶ Trail running basics  │⋮│ ← tap 1    │ │ ▶ Best trails near you  │⋮│
+ │ │ Trending in sports       │ │            │ │ Trending in trail running│ │
+ │ └─────────────────────────┘ │            │ └─────────────────────────┘ │
+ │ ┌─────────────────────────┐ │            │ ┌─────────────────────────┐ │
+ │ │ ▶ Downhill technique    │⋮│ ← tap 2    │ │ ▶ Easy weeknight pasta  │⋮│ ← long-term
+ │ │ New for you              │ │            │ │ Because you watched      │ │   interest
+ │ └─────────────────────────┘ │            │ │ "One-pot meals"          │ │   still there
+ │ ┌─────────────────────────┐ │            │ └─────────────────────────┘ │
+ │ │ ▶ Road marathon pacing  │⋮│            │ ┌─────────────────────────┐ │
+ │ │ Popular this week        │ │            │ │ ▶ Trail shoe review     │⋮│
+ │ └─────────────────────────┘ │            │ └─────────────────────────┘ │
+ └─────────────────────────────┘            └─────────────────────────────┘
+   ⋮ menu on every card: Not interested · Don't show this channel
+   ⚠ the two tapped videos are NOT shown again: "seen" filter, impression memory
+```
+
+```
 09:02  opens the app → feed: their long-term interests + what's trending now
-09:03  taps two trail-running videos
-09:03  pulls to refresh → trail gear and running content move up      ← SECONDS later
-09:04  hides "Road racing shoes" → gone, and so are its near-duplicates ← NEXT response
+09:03  taps two trail-running videos in the feed and watches them
+       (each tap is a click EVENT, streamed into session features)
+09:03  pulls to refresh (drags the feed down to reload it: a NEW request)
+       → more trail-running videos move up                            ← SECONDS later
+09:04  hides a "road marathon pacing" video → gone, and so are its
+       near-duplicates                                                ← NEXT response
 09:05  scrolls to page 3 → no repeats of anything shown on pages 1–2    ← impression memory
 ```
 
@@ -190,10 +221,42 @@ EVENTS     10⁷ × 200    = 2×10⁹/day ≈ 2.3×10⁴/s avg,  ~10⁵/s at pea
   EXACT retrieval: 5×10⁴ × 64 = 3.2×10⁶ multiply-adds ≈ 1–2 ms on one core
   → no ANN index, no recall loss, no index rebuilds; refresh = swap a 13 MB array
 
+  TYPICAL CPU NUMBERS (one modern server core, order of magnitude):
+    compute     SIMD fused multiply-adds (FMAs): AVX2 ≈ 16 per cycle × 3 GHz
+                ≈ 5×10¹⁰ FMA/s peak, ~10¹⁰ FMA/s realistic in a simple loop
+                (1 FMA = 2 FLOPs, so peak ≈ 10¹¹ FLOP/s = 100 GFLOP/s per core)
+    memory      one core streaming from DRAM ≈ 10–20 GB/s
+                (a whole socket ≈ 100–300 GB/s) · from L3 cache: several × faster
+    L3 cache    tens of MB per socket, so the 13 MB table can stay IN CACHE
+  WORKING IT OUT:
+    compute   3.2×10⁶ ÷ ~10¹⁰/s                 ≈ 0.3 ms
+    memory    12.8 MB ÷ ~15 GB/s (from DRAM)    ≈ 0.9 ms   ← the bottleneck
+              (in L3 cache: ~0.2 ms · as int8, 3.2 MB: ~4× less)
+    → MEMORY-BOUND: reading the vectors costs more than the arithmetic,
+      so "1–2 ms" is a safe planning number, and int8 is the first lever
+  COMPARE R1: 10⁶ vectors × 128-d × 4 B = 512 MB per query → ~35 ms at
+    15 GB/s, which is why R1 needs an approximate (ANN) index and R6 doesn't
+    · LATENCY: R1's retrieval slice is ~15 ms of its post-turn budget, so a
+      35 ms scan breaks the SLA on every request
+    · THROUGHPUT: at R1's ~35k QPS peak, 512 MB per query is ~18 TB/s of reads,
+      ~90 CPU sockets doing nothing but scanning. ANN reads a small fraction
+      of the vectors (~1–3 ms) at ~95–99% of the exact top-200's recall
+
 WHY TWO STAGES ANYWAY:
   a DNN ranker at ~1 MFLOP per candidate × 5×10⁴ = 5×10¹⁰ FLOP per request
   × 10⁴ QPS = 5×10¹⁴ FLOP/s: far too expensive
   on ~500 candidates: 5×10⁶ scorings/s ≈ 5×10¹² FLOP/s → a few GPUs or ~100 CPU cores
+
+  WHERE "~1 MFLOP PER CANDIDATE" COMES FROM:
+    a dense layer does one multiply-add (2 FLOPs) per WEIGHT per example, so
+    forward FLOPs ≈ 2 × the DENSE weights the example passes through
+    e.g. MLP 512 → 512 → 256 → 1:  512·512 + 512·256 + 256 ≈ 3.9×10⁵ weights
+         → ≈ 0.8 MFLOP, plus feature crosses and attention over the history ≈ 1
+    ⚠ NOT "10⁶ parameters": EMBEDDING lookups cost almost no FLOPs (they're
+      memory reads), so a recsys model with 10⁹ parameters, mostly embedding
+      tables, can still be ~1 MFLOP per candidate
+    production rankers are often 10–100× bigger (10–100 MFLOP), which is why
+    the cascade (a cheap pre-ranker first) matters even more there
 
 ONLINE STORE   users: 10⁷ × ~2 KB profile + last-50 events ≈ 30 GB, replicated
 LOGS           2×10⁸ requests × 20 impressions × ~1 KB (with served features)
@@ -249,6 +312,12 @@ LATENCY BUDGET (P95 < 100 ms; ~65 ms planned, the rest is tail headroom)
 │ exact two-tower over all 5×10⁴ · co-occurrence from the last 5
 │ items · precomputed candidates (event-triggered) · trending ·
 │ FRESH-ITEM pool (bandit) · FILTER: hidden, seen, expired, policy
+│   EXACT TWO-TOWER, online: ONLY the USER tower runs → q (64-d, normalised)
+│   the ITEM tower does NOT run here: its vectors were computed ahead of
+│   time (at upload, refreshed every minute) into E, a 5×10⁴ × 64 matrix
+│   held in memory · scores = E · q (one matrix-vector product: 5×10⁴ dot
+│   products; vectors normalised, so each dot product IS the cosine) →
+│   keep the top 500 with a partial sort (~1–2 ms)
 │ OUTPUT: ~500 candidates, source-tagged
 └──────┬─────────────────────────────────────────────────────────
        ▼
@@ -263,22 +332,55 @@ LATENCY BUDGET (P95 < 100 ms; ~65 ms planned, the rest is tail headroom)
 └────────────────────────────────────────────────────────────────
 
 ══ NEARLINE (seconds–minutes) ═════════════════════════════════════════════════
- EVENT BUS (partitioned by user) ─► STREAM PROCESSOR
-   · sessionise, dedupe by event ID, event-time windows (5 min / 1 h / 24 h)
-   · update ONLINE STORE: session features, last-N sequence, HIDE LIST
-   · append every feature update, timestamped, to the OFFLINE feature log
-   · trigger: recompute this user's candidate set on strong events
-   · bandit posteriors for fresh items · trending (trust-weighted)
- NEW ITEM ─► policy check ─► content tower ─► embedding ─► broadcast to all pods
- STREAMING TRAINER: join impressions ↔ labels within a wait window → hourly
-   incremental update → GATE → canary → publish (§5.6)
+ CLIENT EVENTS ─► EVENT BUS (Pub/Sub or Kafka, partitioned by user)
+               ─► STREAM PROCESSOR (Dataflow or Flink)
+   1. CLEAN: dedupe by event ID · drop bots · order by EVENT time
+   2. COMPUTE the real-time features, over 5 min / 1 h / 24 h windows:
+        per USER: last-50 item sequence · clicks per category (5 min, 1 h)
+                  · session length · HIDE LIST · times each item was shown
+        per ITEM: click-through rate over the last hour (smoothed) · trending
+   3. WRITE every update TWICE:
+        → ONLINE store:  OVERWRITE the latest value (what serving reads)
+        → OFFLINE store: APPEND a timestamped row (history for training)
+   4. SIDE OUTPUTS, not feature-store writes:
+        → candidate cache: recompute this user's candidates on strong events
+          (STRONG = changes what they want: a click or deep watch, a hide, a
+           purchase or add-to-cart, a search, a follow · WEAK, no recompute:
+           an impression, a scroll-past, a two-second glance)
+        → bandit state: update fresh items' Beta posteriors
+        → the trending list (trust-weighted counts)
+ NEW ITEM ─► policy check ─► content tower ─►
+        → its EMBEDDING: broadcast to every pod's IN-MEMORY catalogue (13 MB)
+        → its starting FEATURES (priors from similar items): ONLINE + OFFLINE
+ STREAMING TRAINER: impressions joined to labels after a wait window → hourly
+   incremental model → GATE → canary → MODEL REGISTRY (§5.6)
 
 ══ OFFLINE (hours–daily) ══════════════════════════════════════════════════════
- impression logs (with served features) + delayed labels (conversions)
-   → point-in-time joins for new features → FULL RETRAIN daily (source of truth)
-   → offline eval → model registry · batch features (long-term affinities)
-   → online store · daily skew check: logged vs recomputed features
+ INPUTS: impression logs WITH the features served (the training rows)
+         + delayed labels (conversions, returns)
+   1. BATCH FEATURES, daily, from the warehouse: long-term user embedding ·
+      category affinities · tenure
+        → ONLINE store:  overwrite, so serving has today's long-term features
+        → OFFLINE store: append, dated
+   2. TRAINING DATA: logged served features + labels; point-in-time joins
+      against the OFFLINE store only for features that are NEW
+   3. FULL RETRAIN daily (the source of truth) → offline eval → MODEL REGISTRY
+   4. DAILY SKEW CHECK: recompute a sample of logged rows from the OFFLINE store
+      and compare with what serving actually logged
 ```
+
+**What goes into which store:**
+
+| | **ONLINE store** | **OFFLINE store** |
+|---|---|---|
+| **Holds** | The **latest** value per user and per item, overwritten | **Every** value, timestamped, append-only |
+| **Real-time features** (from the stream, seconds) | User: last-50 sequence, clicks per category, session length, hide list, times shown · Item: last-hour CTR, trending | The full history of each of those updates |
+| **Batch features** (daily) | Long-term user embedding, category affinities, tenure | The same, one dated row per day |
+| **New items' starting features** | Priors from similar items | The same, timestamped |
+| **Read by** | The ranker, every request (~5–10 ms) | Training-data builds (point-in-time joins), the daily skew check |
+| **On Google Cloud** | Vertex AI Feature Store online serving (Bigtable-based) | BigQuery |
+
+**Not in the feature store at all:** item **embeddings** (an in-memory catalogue on every pod) · the **candidate cache** (its own KV store) · **bandit posteriors** (the bandit's state) · **model weights** (the model registry) · **impression logs** with served features (log tables in the warehouse, joined with the feature store when training data is built).
 
 **The one trick worth naming:** the client sends its **last few events with the request**. That gives read-your-writes for a hide or a tap without waiting for the stream, and the stream catches up a few seconds later.
 
@@ -288,7 +390,10 @@ LATENCY BUDGET (P95 < 100 ms; ~65 ms planned, the rest is tail headroom)
 - **Caches vs hides:** *"A result cache must never show an item the user just hid, so the hide filter runs **after** the cache, on every response (FU 5)."*
 - **The model server goes down:** *"Every stage has a deadline; past it, the next tier down answers: GBDT, cached results, segment-popular (FU 3)."*
 - **Label delay in streaming training** `F1c`: *"An impression with no click yet isn't a negative yet. The streaming trainer waits a window before labelling, and conversions, which arrive later, are trained from the daily job (G22)."*
-- **The latency squeeze** `F2b` `A1c`: *"If the ranker can't fit 500 candidates into 25 ms, I won't shrink it for everyone. I'd cut the candidate count with a distilled pre-ranker and move candidate generation to event-triggered precompute."*
+- **The latency squeeze** `F2b` `A1c`: *"Say the ranker can't score 500 candidates inside its 25 ms. A smaller ranker for everyone would lower quality on every request, so I wouldn't do that. Instead:"*
+  1. **Send the ranker only the best ~200.** A **pre-ranker**, a small model trained to imitate the ranker's scores, scores all 500 cheaply (~2 ms) and passes on its top 200, so the ranker does 60% less work. ⚠ Pick the 200 with the pre-ranker, **not** by retrieval score: retrieval is too crude to know which 200 the ranker would like. Check offline that the ranker's own top 20 almost always survives the cut.
+  2. **Move candidate generation off the request path.** Recompute each user's candidates in the background whenever a strong event arrives (a click, hide, purchase or search), and keep them in the candidate cache. The request then just reads them, and the milliseconds saved go to the ranker.
+  - *"The heavy ranker stays the same size; it just scores only the candidates worth its time."*
 
 ### The defensible choices — know the trade for each
 
@@ -319,6 +424,8 @@ LATENCY BUDGET (P95 < 100 ms; ~65 ms planned, the rest is tail headroom)
 | | **Batch (daily)** | **Streaming (seconds)** | **On-demand (per request)** |
 |---|---|---|---|
 | **User** | Long-term embedding · category affinities (decayed counts) · tenure · locale | **Last-50 item sequence** · clicks per category in the last 5 min / 1 h · session length · **hide list** · time since last visit | — |
+
+> **Where the long-term user embedding comes from** (three options, simplest first): **(1)** a decayed average of the embeddings of items the user engaged with, with no model at all; **(2)** the **retrieval model's own user tower**, run in a daily batch over months of history (the usual choice: no extra model to own); **(3)** a **dedicated user model**, e.g. a sequence transformer trained to predict the user's future engagement, shared across products (Pinterest's PinnerFormer is a published example). In every case it's **precomputed daily**, because encoding hundreds of past events per request is expensive and long-term taste moves slowly; the session features cover what changed today. ⚠ It's a dependency: retrain the user model and the ranker's input shifts, so version them together.
 | **Item** | Content embedding (text, image) · category · creator quality · age | **CTR in the last hour, Bayesian-smoothed** · trending velocity · availability | — |
 | **Context** | — | — | Time of day · day of week · device · network · surface · referrer |
 | **User × item** | Long-term affinity to the item's category | **Times shown to this user in 24 h** (impression fatigue) | **Similarity of the candidate to the last-clicked items** · candidate × context crosses |
@@ -364,6 +471,23 @@ MISSING / STALE: past its TTL a feature returns its DEFAULT + a "missing" flag;
   the model is trained with ~5% feature dropout, so this is in-distribution
 ```
 
+**Example feature stores** (name one, then say what you need from it: one definition, two stores, point-in-time joins, streaming writes):
+
+| Feature store | Kind | Online store (serving) | Offline store (training) |
+|---|---|---|---|
+| **Feast** | Open source | Pluggable: Redis, DynamoDB, Bigtable… | Pluggable: BigQuery, Snowflake, Parquet files… |
+| **Vertex AI Feature Store** | Managed (Google Cloud) | Bigtable-based or optimised online serving | BigQuery |
+| **SageMaker Feature Store** | Managed (AWS) | A low-latency online store | S3, queryable through Athena / Glue |
+| **Databricks feature engineering** | Managed (Databricks) | Online tables | Delta tables |
+| **Tecton** | Managed (commercial) | Redis or DynamoDB | A data warehouse or lake |
+| **Hopsworks** | Open source + managed | RonDB | A data lake (Hudi tables) |
+| **Chronon** (Airbnb) · **Feathr** (LinkedIn) | Open-sourced in-house platforms | KV stores | Data lake / warehouse |
+| **Michelangelo Palette** (Uber) | In-house, published | Cassandra-based | Hive / data lake |
+
+> ⚠ **BigQuery is the OFFLINE side, not the online one.** In Vertex AI Feature Store, features are registered over **BigQuery** tables (the offline store and source of truth) and **synced** into an online store (Bigtable-based or optimised serving) that answers in milliseconds. A BigQuery query takes seconds, far too slow inside a 100 ms request. Seconds-fresh **session features** come from the stream (Dataflow) written straight to a low-latency store, and are also appended to BigQuery for training history. Point-in-time lookups for training run in BigQuery SQL (e.g. its `ML.FEATURES_AT_TIME` functions, or window functions).
+
+> **Say:** *"Something like Feast or Vertex AI Feature Store: one feature definition, a Bigtable- or Redis-backed online store for serving, a warehouse offline store for training with point-in-time joins, and streaming writes for the session features."*
+
 ### 5.4 Baseline first, then the advanced model (d) `A2b` `F1a`
 
 | Stage | **Baseline** (weeks 1–4) | **Advanced** |
@@ -372,6 +496,61 @@ MISSING / STALE: past its TTL a feature returns its DEFAULT + a "missing" flag;
 | **Ranker** | **GBDT** (or logistic regression) on ~100 hand-built features: smoothed CTR, user–category affinity, recency, fatigue, context | **DNN with explicit feature crosses** (DCN-v2 style) + **target attention** over the last 50 events (which recent items matter for *this* candidate) · **multi-task**: click, dwell/conversion, hide · shallow position tower |
 | **Re-rank** | Rules: dedupe, one per creator per 5, freshness boost | MMR diversity + bandit exploration slots |
 | **Freshness** | Streaming counts | + hourly incremental weights, minute-level fresh-item embeddings |
+
+**Inside the advanced ranker: target attention and explicit crosses.**
+
+```
+TARGET ATTENTION (DIN-style): the user's history is summarised DIFFERENTLY for
+each candidate, by attending to the past items that are relevant to IT
+  history h₁…h₅₀ (last 50 items) · candidate v
+  a_i = softmax_i( score(h_i, v) )   score = a small MLP on [h_i, v, h_i ⊙ v]
+                                     (or simply h_iᵀ·W·v)
+  u_v = Σ_i a_i · h_i                → "this user, as seen from candidate v"
+
+  e.g. history: hiking boots · tent · pasta recipe · running shoes
+    candidate "trail running shoes"  → weights ≈ 0.45 · 0.10 · 0.02 · 0.43
+    candidate "one-pot pasta"        → weights ≈ 0.03 · 0.02 · 0.90 · 0.05
+  → one averaged user vector would blur hiking and cooking together;
+    attention lets the relevant slice of history speak for each candidate
+  cost: 50 history items × 500 candidates = 25k small scores per request: fine
+
+  [h_i, v, h_i ⊙ v] is ONE vector: three 64-d vectors CONCATENATED → 192-d
+    h_i ⊙ v = the ELEMENTWISE product (multiply position by position): it hands
+    the MLP "where the two items agree", which it struggles to learn from h_i
+    and v alone. DIN also adds h_i − v → [h_i, v, h_i − v, h_i ⊙ v], 256-d
+  softmax_i = a softmax OVER i, the 50 history items, for ONE candidate v:
+    a_i = exp(s_i) / Σ_j exp(s_j), s_i = score(h_i, v) → positive, sums to 1
+    e.g. scores 2.0 · 0.5 · −1.5 · 2.0 → exp 7.39 · 1.65 · 0.22 · 7.39 (sum 16.65)
+         → weights 0.44 · 0.10 · 0.01 · 0.44
+    each candidate gets its OWN softmax over the same history
+
+EXPLICIT FEATURE CROSSES (DCN-v2): layers that multiply features together
+  x_{l+1} = x₀ ⊙ ( W_l · x_l + b_l ) + x_l
+    x₀    the ORIGINAL input: all features concatenated (user embedding,
+          candidate embedding, context, dense features); fed into layer 1
+          AND reused in every layer
+    x_l   the OUTPUT of cross layer l, which is the input to layer l + 1
+          (x₁ = layer 1's output, x₂ = layer 2's, …)
+    W_l, b_l  layer l's learned weights and bias · ⊙ elementwise product
+    + x_l     a residual: keep what layer l already had
+  each layer MULTIPLIES by x₀ again, so it raises the interaction order by one:
+    layer 1 → pairs ("affinity to running × item is a running item"),
+    layer 2 → three-way products, and so on
+  e.g. x₀ = [0.8 affinity to running · 1.0 category = running · 0.3 evening]
+       if row 1 of W₀ has learned to pick the category: (W₀·x₀)₁ = 1.0
+       x₁[1] = 0.8 × 1.0 + 0.8 = 1.6   ← contains affinity × category
+  → learns interactions like "this user's affinity × this item's category"
+    directly, instead of hoping a plain MLP discovers them; cross layers
+    usually run in parallel with (or before) an MLP, and both feed the heads
+
+THEN: [u_v, candidate features, context, crosses] → MLP → the heads
+  (click, dwell/conversion, hide)
+```
+
+**Exploration belongs in retrieval too, not only in the final slots.** A re-ranker can only explore among candidates retrieval returned; an item that never reaches the candidate set can never be explored. So exploration runs at **both** levels:
+- **Retrieval:** the **fresh-item pool** is its own candidate source with a quota, and a share of each request's candidates can be sampled from uncertain or tail items, or retrieved with noise added to the query vector (Thompson-style).
+- **Re-rank:** the bandit's exploration slots decide which of those candidates actually get shown.
+- ⚠ **Propensities get harder:** an item's chance of being shown is now P(reached the candidate set) × P(picked for a slot), and both must be logged for off-policy evaluation to stay valid.
 
 **Why build the baseline first:** it forces the logging, the feature store and the A/B pipeline into existence; it sets the bar the DNN must beat online; and it **stays in production as the fallback** when the DNN misses its deadline.
 
@@ -382,6 +561,24 @@ THE VALUE SCORE (calibrated heads, owned weights):
   V = p_click · (w_d · ŷ_dwell + w_c · p_convert) − w_h · p_hide
   ranker loss: Σ_k α_k · BCE(head_k), each head masked to rows with its label
 ```
+
+**How many models? The full inventory.**
+
+| # | Learned model | What it does | When it runs |
+|---|---|---|---|
+| **1** | **Two-tower retrieval** (one model, two towers) | **User tower:** long-term embedding + session sequence + context · **Item tower:** item content + ID, for the whole ~5×10⁴-item catalogue | User tower per request; item tower precomputed |
+| **2** | **Sequence model** (transformer over the last ~50 events) | Predicts the next item **in this session**: a second candidate source | Per request |
+| **3** | **Content encoder** (pretrained text–image, LoRA-tuned) | Embeds **new items** so they're retrievable on day 0 | At item upload |
+| **4** | **Pre-ranker** (distilled from the ranker) | Cuts 500 candidates to ~200, only if latency is tight | Per request |
+| **5** | **Main ranker:** DNN with DCN-v2 crosses + target attention, multi-task heads (click, dwell/conversion, hide) | Orders the candidates | Per request |
+| | ↳ **Shallow position tower** | Absorbs position bias | **Training only**, dropped at serving |
+| **6** | **GBDT baseline** | The v0 ranker, **kept loaded as the fallback** when the DNN misses its deadline | Per request, on fallback |
+
+**Not models, but statistics or algorithms:** the co-occurrence table (item-to-item counts, a candidate source) · segment popularity and trending counts (candidate sources, cold start) · the **Thompson-sampling bandit** (Beta posteriors for fresh items, a category bandit for new users) · **isotonic calibration** per ranker head · the **MMR** diversity re-rank.
+
+> **The long-term user embedding is not a separate model:** it's model 1's **user tower run in a daily batch** over long history. And the catalogue is ~5×10⁴ items ("tens of thousands"), not 10k.
+>
+> **The shape to draw:** retrieval (models 1, 2, 3 + co-occurrence + trending) → pre-ranker (4) → ranker (5, with 6 as fallback) → calibration → MMR + bandit slots.
 
 ### 5.5 Cold start, several strategies each (e) (f) `F2a` `F1c`
 
@@ -404,6 +601,8 @@ THE VALUE SCORE (calibrated heads, owned weights):
 | **Content-based embedding** | A content tower (text + image + metadata) places it in the same space as warm items; trained with **ID dropout** so it works without an ID | Recommendable within minutes |
 | **Priors** | Smoothed-CTR prior from the k nearest items in content space and from the **creator's** history | The ranker needs a starting point |
 | **Exploration** | **Thompson sampling**: each fresh item keeps a Beta(α, β) posterior on CTR, **updated from the stream in seconds**; exploration slots go to the highest sampled CTR; propensities logged | ⭐ Real-time is the best cold-start tool: a new item's estimate tightens within minutes |
+
+> **The Beta posterior, from the item's own click stream:** start from a **prior** borrowed from similar items, e.g. category CTR 4% → Beta(α = 2, β = 48). Then every **examined** impression of this item updates it: a click → α + 1; shown and not clicked → β + 1. After 100 impressions with 8 clicks: Beta(10, 140), mean 6.7%, and much narrower. Per request, each fresh candidate draws a sample θ ~ Beta(α, β) and the highest θ wins the exploration slot, so an uncertain item sometimes draws high and gets tried, while a clearly weak one rarely does. It **graduates** to the normal sources once the posterior is tight enough.
 | **Graduation** | When the posterior is tight enough, the item leaves the fresh pool for the main sources | The boost decays as evidence arrives |
 
 ### 5.6 Keeping the model fresh: four cadences `F2c` `F1c`
@@ -509,6 +708,38 @@ A/B        hash USER IDs into arms · layered experiments for independent change
            · guardrails: P95 latency, error rate, hide rate, crash rate, retention
 INTERLEAVING for ranker-vs-ranker: a faster read on ranking quality
 HOLDOUT     ~1% on the old system for months: retention, the long-term truth
+```
+
+**Interleaving, worked through** (team-draft, the common version):
+
+```
+ONE USER, ONE REQUEST. Both rankers rank the SAME candidates:
+  rank   ranker A (current)          ranker B (new)
+   1     "Easy weeknight pasta"      "Trail running: hills"
+   2     "Trail running: hills"      "Best trails near you"
+   3     "Road marathon pacing"      "Trail shoe review"
+   4     "Best trails near you"      "Easy weeknight pasta"
+
+BUILD ONE LIST by taking turns, like captains picking teams (a coin flip
+decides who picks first; each takes its best item not yet picked):
+  coin flip → B first:  B picks "Trail running: hills"   (tagged B)
+                        A picks "Easy weeknight pasta"   (tagged A)
+                        B picks "Best trails near you"   (tagged B)
+                        A picks "Road marathon pacing"   (tagged A)
+  SHOWN: hills (B) · pasta (A) · best trails (B) · marathon (A)
+
+THE USER TAPS "hills" and "best trails" → both B's picks → B wins 2–0
+  (a tap on "pasta" would have given A a point)
+
+OVER MANY REQUESTS: B wins 5,400 · A wins 4,100 · 500 ties
+  → B preferred on 57% of decided requests: clearly significant after
+    ~10⁴ requests, where an A/B test might need 10–100× more traffic
+
+WHY IT'S FAIR: the coin flip balances who gets slot 1; the SAME user judges
+  both rankers on the SAME request, so a picky user or an easy request
+  cancels out
+WHAT IT CAN'T TELL YOU: how much a business metric (retention, conversion)
+  would move → interleaving picks the winner fast, an A/B measures the effect
 ```
 
 > ⚠ **The real-time-specific trap:** *"Continuously trained models contaminate each other in an A/B. If both arms' models are retrained hourly on the **pooled** logs, control learns from treatment's traffic and the measured difference shrinks. For model experiments, each arm trains on **its own arm's logs**, or I accept and report the bias."* (FU 8)
