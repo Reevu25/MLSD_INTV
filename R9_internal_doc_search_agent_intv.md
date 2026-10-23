@@ -138,7 +138,8 @@
 | **Fast path** (~70% of questions) | **p95 < 2 s to first token**, streamed |
 | **Agent path** (~25%) | First progress update **< 1 s**; answer **p95 < 8 s** to first token |
 | **Permission correctness** | **0 leaks**, including the **existence** of documents |
-| **Revocation → effect** | **< 60 s** p99, and checked live at query time |
+| **Revocation → effect** | **< 60 s** p99, and checked live at query time (a **safety** SLO: a late revocation is exposure) |
+| **Grant → effect** | Two kinds (a **usefulness** SLO: a late grant is only an inconvenience): **via group membership** (user added to a group already on the document's ACL) → **seconds**, because the index tags already list the group and only the user's principal set changes · **via the document's own ACL** (shared with a new user or group) → **≤ 5 min**, because the index tags must be updated first: the query-time re-check can only **drop** candidates, so a document the pre-filter excludes never reaches it |
 | **Edit / delete → effect** | Searchable or gone **≤ 5 min**; deleted content never cited (R8's registry) |
 | **Cost** | Average **$/answer** within budget, tracked per route; agent answers capped by a step and token budget |
 | Availability | 99.9%; **fail closed** on permission checks (§6.4) |
@@ -380,10 +381,20 @@ LAYER 3 · EVERY AGENT TOOL CARRIES THE USER'S DELEGATED IDENTITY
   search, fetch and list all run AS the user, through the same gate
   → the agent can never read more than the person asking, whatever steers it
 
-PROPAGATION, asymmetric by design:
-  REVOCATION (urgent): registry + a DENY-SET checked at query time, < 60 s p99;
-                        index tags updated asynchronously
-  GRANT (not urgent):   flows through the normal index update, minutes
+PROPAGATION, by WHAT changed (most real changes are group memberships):
+                         GROUP MEMBERSHIP changed       the DOCUMENT's ACL changed
+                         (user joins / leaves group G)  (doc shared / unshared)
+  what changes           the USER's principal set       the document's ACL tags
+  index re-tagging?      NO: docs already list G        YES (no re-embedding)
+  GRANT  → visible in    SECONDS: invalidate the        ≤ 5 MIN: re-tag the chunks;
+                         user's cached principals        until then the pre-filter
+                                                         excludes it, and the
+                                                         re-check can't ADD it back
+  REVOKE → enforced in   SECONDS: invalidate the        < 60 s: registry + DENY-SET
+                         principal cache; the re-check   checked at query time; the
+                         uses the fresh set              index re-tag follows
+  → revocations are urgent (exposure) and always seconds; grants are only
+    slow when the document's own ACL changed
 PRINCIPALS: user + groups, nested groups expanded ONCE per query (a graph walk),
   cached ~5 min and invalidated by group-change events
 ```
